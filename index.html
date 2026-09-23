@@ -295,7 +295,7 @@ const PERF_REQUIRED = ['Delivery City', 'FE Name', 'Delivery Centre', 'Network M
   'Same Day Delivery', 'Same Day Attempt', 'Packet Type', 'Service Type', 'Delivered/Verified Undelivered',
   'Payment Type', 'Is Office Closed'];
 // removed only when the Status is EXACTLY one of these (never "contains")
-const PERF_DROP = ['BAGGING', 'BAG DISPATCHED TO HUB CENTRE', 'DELIVER TO HUB'];
+const PERF_DROP = ['BAGGING', 'BAG DISPATCHED TO HUB CENTRE', 'DELIVER TO HUB', 'DISPATCHED TO DELIVERY CENTRE'];
 // one day = [load, SLA, PPD FASR, COD FASR, Del.+VC, SLA with OC (Sundays only, else null), FE COUNT]
 const PERF_LABELS = ['TOTAL LOAD', 'SLA%', 'PPD FASR %', 'COD FASR%', 'Del.+VC%', 'SLA with OC', 'FE COUNT'];
 const PERF_PCT = [1, 2, 3, 4, 5];
@@ -1197,10 +1197,10 @@ function perfTable(day, opts) {
   const freshKeys = new Set((day.fresh || []).map(r => r.key));
   const cols = day.sunday ? PERF_LABELS : PERF_LABELS.filter((_, i) => i !== 5);
   const idx = day.sunday ? [0, 1, 2, 3, 4, 5, 6] : [0, 1, 2, 3, 4, 6];   // which of the 7 raw cells to show, in order
-  const scales = editable ? perfScales(day) : null;
+  const scales = perfScales(day);   // heatmap shows regardless of whether the table is editable
   const dataCells = arr => idx.map(i => {
     const v = (arr || [])[i];
-    const bg = editable && scales ? scaleColorPerf(v, scales[i]) : null;
+    const bg = scales ? scaleColorPerf(v, scales[i]) : null;
     return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + perfFmtCell(i, v) + '</td>';
   }).join('');
   let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm">CLUSTER/HUB</th>' +
@@ -1302,7 +1302,7 @@ function drawPerfDay(day, withTitle) {
   const tableW = colW.reduce((a, b) => a + b, 0);
   let nRows = 0; day.groups.forEach(g => { nRows += 1 + g.hubs.length; });
   if (day.total) nRows += 1;
-  const scales = !day.fixed ? perfScales(day) : null;
+  const scales = perfScales(day);   // heatmap shows regardless of fixed/live day
   const W = tableW + pad * 2, H = titleH + headH + rowH * nRows + pad * 2;
 
   const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S;
@@ -1330,7 +1330,7 @@ function drawPerfDay(day, withTitle) {
     idx.forEach((i, k) => {
       const v = (cells || [])[i];
       let bg = fill;
-      if (!fill && !day.fixed) bg = scaleColorPerf(v, scales && scales[i]);
+      if (!fill) bg = scaleColorPerf(v, scales && scales[i]);
       cellBox(xx, y, colW[k + 1], rowH, bg);
       ctx.fillStyle = '#000'; ctx.font = (bold ? 'bold ' : '') + '13px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
       ctx.fillText(v == null ? '\u2013' : perfFmtCell(i, v).replace('&ndash;', '\u2013'), xx + colW[k + 1] / 2, y + rowH / 2 + 1);
@@ -1394,6 +1394,36 @@ function perfCanonicalRows(view) {
     if (hubs.length) rows.push({ mgr: g.mgr, hubs: hubs.map(k => ({ key: k, name: vh.names[k] })) });
   });
   return rows;
+}
+
+/* One table with every date side by side, hub rows down the left, matching the layout of the
+   old master workbook so a trend across the last few days reads left to right on one screen.
+   Used on the shared report page; the interactive tool keeps one date at a time so edits
+   (remove/keep/hide a branch) clearly apply to the day being worked on. */
+function perfMultiTable(view, dates) {
+  const days = dates.map(d => perfDay(view, d));
+  const canon = perfCanonicalRows(view);
+  const maps = days.map(perfDayMap);
+  const idxs = days.map(d => d.sunday ? [0, 1, 2, 3, 4, 5, 6] : [0, 1, 2, 3, 4, 6]);
+  const scales = days.map(perfScales);
+  let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm" rowspan="2">CLUSTER/HUB</th>' +
+    days.map((d, di) => '<th colspan="' + idxs[di].length + '">' + esc(fmtDay(dates[di])) + (d.sunday ? ' (Sun)' : '') + '</th>').join('') + '</tr><tr>' +
+    days.map((d, di) => idxs[di].map(i => '<th>' + esc(PERF_LABELS[i]) + '</th>').join('')).join('') + '</tr></thead><tbody>';
+  const dataCells = (di, cells) => idxs[di].map(i => {
+    const v = (cells || [])[i];
+    const bg = scales[di] ? scaleColorPerf(v, scales[di][i]) : null;
+    return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + perfFmtCell(i, v) + '</td>';
+  }).join('');
+  canon.forEach(g => {
+    h += '<tr class="mgr"><td class="nm">' + esc(g.mgr) + '</td>' + days.map((d, di) => dataCells(di, maps[di].get('M:' + g.mgr))).join('') + '</tr>';
+    g.hubs.forEach(hub => {
+      h += '<tr><td class="nm">' + esc(hub.name) + '</td>' + days.map((d, di) => dataCells(di, maps[di].get('H:' + hub.key))).join('') + '</tr>';
+    });
+  });
+  h += '<tr class="tot"><td class="nm">Grand Total</td>' + days.map((d, di) => dataCells(di, d.total)).join('') + '</tr>';
+  h += '</tbody></table></div>';
+  const capped = days.some(d => d.capped);
+  return { html: h, capped };
 }
 
 async function downloadPerfExcel() {
@@ -1580,14 +1610,15 @@ function buildReportHTML() {
     ofdData = zs.map((z, i) => ({ id: 'oz' + i, zone: z, d: computeZone(z) }));
   }
   if (havePerf) {
-    perfData = PERF_VIEWS.filter(v => perfLastDays(v, PERF_WINDOW).length).map((v, i) => ({
-      id: 'pv' + i, view: v, dates: perfLastDays(v, PERF_WINDOW).map(dt => ({ date: dt, day: perfDay(v, dt) }))
-    }));
+    perfData = PERF_VIEWS.filter(v => perfLastDays(v, PERF_WINDOW).length).map((v, i) => {
+      const dates = perfLastDays(v, PERF_WINDOW);
+      return { id: 'pv' + i, view: v, dates, table: perfMultiTable(v, dates) };
+    });
   }
   const runtimeData = {
     stamp: stampText(), showTitle: state.showTitle,
     ofd: ofdData ? ofdData.map(x => ({ zone: x.zone, file: ofdImgName(x.zone), shown: x.d.shown.map(r => ({ cells: r.cells })), total: { cells: x.d.total.cells, fb: x.d.total.fb }, scales: x.d.scales })) : null,
-    perf: perfData ? perfData.map(x => ({ view: x.view, dates: x.dates.map(y => ({ date: y.date, file: perfImgName(x.view, y.date), day: y.day })) })) : null
+    perf: perfData ? perfData.map(x => ({ view: x.view, dates: x.dates.map(dt => ({ date: dt, file: perfImgName(x.view, dt), day: perfDay(x.view, dt) })) })) : null
   };
 
   const drawSrc = 'const HEADERS=' + JSON.stringify(HEADERS) + ',COL_W=' + JSON.stringify(COL_W) + ',PCT_COLS=' + JSON.stringify(PCT_COLS) +
@@ -1604,11 +1635,6 @@ function buildReportHTML() {
     'var t=[].slice.call(document.querySelectorAll("[data-tab]")),s=[].slice.call(document.querySelectorAll("section[data-sec]"));' +
     'function show(id){s.forEach(function(x){x.hidden=x.dataset.sec!==id});t.forEach(function(b){b.setAttribute("aria-pressed",b.dataset.tab===id)})}' +
     't.forEach(function(b){b.onclick=function(){show(b.dataset.tab)}});if(t.length)show(t[0].dataset.tab);' +
-    'var dt=[].slice.call(document.querySelectorAll("[data-dtab]"));' +
-    'function showD(view,date){dt.forEach(function(b){if(b.dataset.view===view)b.setAttribute("aria-pressed",b.dataset.dtab===date)});' +
-      'document.querySelectorAll("[data-dsec][data-view=\\""+view+"\\"]").forEach(function(x){x.hidden=x.dataset.dsec!==date})}' +
-    'dt.forEach(function(b){b.onclick=function(){showD(b.dataset.view,b.dataset.dtab)}});' +
-    'var seen={}; dt.forEach(function(b){if(!seen[b.dataset.view]){seen[b.dataset.view]=1;showD(b.dataset.view,b.dataset.dtab)}});' +
     'function ofdBlob(i){var z=DATA.ofd[i];var cv=drawZone({zone:z.zone,shown:z.shown,total:z.total,scales:z.scales},DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     'function perfBlobAt(vi,date){var v=DATA.perf[vi];var e=v.dates.filter(function(x){return x.date===date})[0];var cv=drawPerfDay(e.day,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     'function saveAs(blob,name){var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href)},4000)}' +
@@ -1638,16 +1664,12 @@ function buildReportHTML() {
     body += '<div class="rsec" id="r-perf"' + (rtabs.length > 1 ? ' hidden' : '') + '>';
     body += '<div class="tabs" role="group" aria-label="Views">' + perfData.map(x => '<button type="button" data-tab="' + x.id + '" aria-pressed="false">' + esc(x.view) + '</button>').join('') + '</div>';
     perfData.forEach((x, i) => {
+      const notes = [];
+      if (x.table.capped) notes.push(CAP_NOTE);
       body += '<section data-sec="' + x.id + '" class="panel" hidden>';
-      body += '<div class="ph"><h2>' + esc(x.view) + '</h2><div class="a"><div class="tabs mini">' +
-        x.dates.map(y => '<button type="button" data-view="' + esc(x.view) + '" data-dtab="' + y.date + '" aria-pressed="false">' + esc(fmtDay(y.date)) + '</button>').join('') + '</div></div></div>';
-      x.dates.forEach(y => {
-        const notes = [];
-        if (y.day.capped) notes.push(CAP_NOTE);
-        body += '<div data-dsec="' + y.date + '" data-view="' + esc(x.view) + '" hidden><div class="ph"><span class="meta">' + esc(fmtDateLong(y.date)) + (y.day.sunday ? ' &middot; Sunday' : '') + '</span>' +
-          '<button type="button" data-pimg-v="' + i + '" data-pimg-d="' + y.date + '">Save as image</button></div>' +
-          perfTable(y.day, { static: true }) + (notes.length ? '<p class="note">' + notes.join(' ') + '</p>' : '') + '</div>';
-      });
+      body += '<div class="ph"><h2>' + esc(x.view) + '</h2><div class="a">' +
+        x.dates.map(dt => '<button type="button" data-pimg-v="' + i + '" data-pimg-d="' + dt + '">Save ' + esc(fmtDay(dt)) + '</button>').join('') + '</div></div>';
+      body += x.table.html + (notes.length ? '<p class="note">' + notes.join(' ') + '</p>' : '');
       body += '</section>';
     });
     body += '</div>';
