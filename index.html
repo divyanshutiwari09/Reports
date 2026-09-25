@@ -915,7 +915,7 @@ function setChoice(zone, key, val) {
 
 /* ---- OFD image ---- */
 function drawZone(d, withTitle) {
-  const S = 2, pad = 14, rowH = 27, headH = 60, titleH = withTitle ? 40 : 0;
+  const S = 3, pad = 14, rowH = 27, headH = 60, titleH = withTitle ? 40 : 0;
   const mc = document.createElement('canvas').getContext('2d');
   mc.font = '13px Arial, Helvetica, sans-serif';
   let w0 = 150;
@@ -1377,9 +1377,9 @@ function renderPerf() {
 /* ==========================================================================
    PERFORMANCE IMAGE
    ========================================================================== */
-const PERF_COL_W = [92, 68, 78, 76, 68, 88, 70];
+const PERF_COL_W = [88, 58, 66, 64, 58, 72, 58];
 function drawPerfDay(day, withTitle) {
-  const S = 2, pad = 14, rowH = 26, headH = 40, titleH = withTitle ? 38 : 0;
+  const S = 3, pad = 14, rowH = 26, headH = 40, titleH = withTitle ? 38 : 0;
   const cols = day.sunday ? PERF_LABELS : PERF_LABELS.filter((_, i) => i !== 5);
   const idx = day.sunday ? [0, 1, 2, 3, 4, 5, 6] : [0, 1, 2, 3, 4, 6];
   const mc = document.createElement('canvas').getContext('2d');
@@ -1469,7 +1469,7 @@ function drawPerfMultiDay(view, dates, withTitle) {
   const idxs = days.map(d => d.sunday ? [0, 1, 2, 3, 4, 5, 6] : [0, 1, 2, 3, 4, 6]);
   const scales = days.map(perfScales);
 
-  const S = 2, pad = 14, rowH = 25, headH1 = 24, headH2 = 34, titleH = withTitle ? 36 : 0;
+  const S = 3, pad = 14, rowH = 25, headH1 = 24, headH2 = 34, titleH = withTitle ? 36 : 0;
   const mc = document.createElement('canvas').getContext('2d'); mc.font = '13px Arial, Helvetica, sans-serif';
   let w0 = 168;
   canon.forEach(g => { w0 = Math.max(w0, Math.ceil(mc.measureText(g.mgr).width) + 20); g.hubs.forEach(h => { w0 = Math.max(w0, Math.ceil(mc.measureText('  ' + h.name).width) + 24); }); });
@@ -1870,9 +1870,9 @@ function codSetChoice(region, key, val) { codChoices[region][key] = val; saveCod
 /* ==========================================================================
    IMAGE
    ========================================================================== */
-const COD_COL_W = [86, 86, 76, 82, 82, 82, 76, 86, 86, 76, 82, 82, 82, 76];
+const COD_COL_W = [78, 78, 68, 74, 74, 74, 68, 78, 78, 68, 74, 74, 74, 68];
 function drawCod(d, withTitle) {
-  const S = 2, pad = 14, rowH = 26, headH1 = 24, headH2 = 40, titleH = withTitle ? 38 : 0;
+  const S = 3, pad = 14, rowH = 26, headH1 = 24, headH2 = 40, titleH = withTitle ? 38 : 0;
   const mc = document.createElement('canvas').getContext('2d'); mc.font = '13px Arial, Helvetica, sans-serif';
   let w0 = 170;
   d.sections.forEach(sec => sec.rows.forEach(r => { w0 = Math.max(w0, Math.ceil(mc.measureText(r.name).width) + 20); }));
