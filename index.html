@@ -567,23 +567,37 @@ function parseCodRows(rows, head) {
   const C = { branch: col('Branch'), amt: col('COD Amt.'), coll: col('COD Collection Date'),
               feSub: col('FE Submitted'), feDate: col('FE Submit Date'), rel: col('Related Box'), city: col('Delivery City') };
   const S = v => (v == null ? '' : String(v).trim());
-  const today = new Date(); const todayUTC = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate());
-  const codes = new Map();
-  let total = 0, noBranch = 0;
+
+  // Reference date is derived from the data itself (the latest COD Collection Date /
+  // FE Submit Date found in the file), NOT from the live clock. Using new Date() here
+  // meant every bucket shifted depending on the exact moment the browser rendered the
+  // report, which silently misclassified rows right at the day boundary (worst for the
+  // Branch "NEW" rule, which only counts an exact bucket-1 match). Anchoring to the max
+  // date in the file makes the result reproducible no matter when/where it's opened.
+  let maxDateUTC = null;
+  const parsedRows = [];
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
     if (!row || !row.length) continue;
+    const collDate = C.coll >= 0 ? codParseDate(row[C.coll]) : null;
+    let feDate = null;
+    if (S(row[C.feSub]) === 'Yes' && C.feDate >= 0) feDate = codParseDate(row[C.feDate]);
+    if (collDate != null && (maxDateUTC == null || collDate > maxDateUTC)) maxDateUTC = collDate;
+    if (feDate != null && (maxDateUTC == null || feDate > maxDateUTC)) maxDateUTC = feDate;
+    parsedRows.push({ row, collDate, feDate });
+  }
+  const fallback = new Date();
+  const todayUTC = maxDateUTC != null ? maxDateUTC : Date.UTC(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
+
+  const codes = new Map();
+  let total = 0, noBranch = 0;
+  for (const { row, collDate, feDate } of parsedRows) {
     total++;
     const branch = S(row[C.branch]);
     if (!branch) { noBranch++; continue; }
     const amt = Number(row[C.amt]) || 0;
-    const collDate = C.coll >= 0 ? codParseDate(row[C.coll]) : null;
     const bucket = collDate != null ? codBucket(Math.round((todayUTC - collDate) / 86400000)) : null;
-    let bucket1 = null;
-    if (S(row[C.feSub]) === 'Yes' && C.feDate >= 0) {
-      const feDate = codParseDate(row[C.feDate]);
-      if (feDate != null) bucket1 = codBucket(Math.round((todayUTC - feDate) / 86400000));
-    }
+    const bucket1 = feDate != null ? codBucket(Math.round((todayUTC - feDate) / 86400000)) : null;
     const rel = C.rel >= 0 ? S(row[C.rel]) : '';
     const key = bkey(branch);
     let a = codes.get(key);
