@@ -256,7 +256,8 @@ window.__SEED__ = {"MUMBAI":{"in":["ANDHERI HUB","BORIVALI HUB","CBD-BELAPUR_HUB
 const REPORTS = [
   { id: 'ofd',  name: 'OFD dashboard' },
   { id: 'perf', name: 'Daily performance' },
-  { id: 'cod',  name: 'COD Pendency' }
+  { id: 'cod',  name: 'COD Pendency' },
+  { id: 'ds',   name: 'DS Performance' }
 ];
 
 /* ---- OFD report ---- */
@@ -295,6 +296,17 @@ const CAP_NOTE = 'Any percentage above 100% is shown as 100%.';
 const COD_REGIONS = ['DELHI', 'MUMBAI', 'BENGALURU', 'Zone B'];
 const COD_REQUIRED = ['AWB No.', 'COD Amt.', 'FE Submitted', 'COD Collection Date'];               // file-type signature
 const COD_NEEDED = COD_REQUIRED.concat(['Branch', 'FE Submit Date', 'Related Box', 'Delivery City']);
+
+/* ---- DS Performance (franchisee SLA report) ---- */
+const DS_REQUIRED = ['AWB NO', 'FRANCHISEE', 'CITY', 'CUT-OFF CATEGORY', 'FIRST ATTEMPT', 'FIRST ATTEMPT DATE',
+  'FIRST ATTEMPT TIME', 'SAME DAY ATTEMPT', 'DELIVERED', 'UNDELIVERED TYPE', 'CALCULATED ORDER DATE', 'CALCULATED ORDER TIME', 'TAT TYPE'];
+const DS_ZONES = ['Delhi NCR', 'Zone B'];
+const DS_ZONEB_RE = /agra|amritsar|dehradun|jalandhar|kanpur|lucknow|meerut/i;
+const DS_LABELS = ['TOTAL COUNT', 'IN TAT SLA', 'SAME DAY SLA', 'FASR', 'DEL+VC'];
+const DS_PCT = [1, 2, 3, 4];
+const DS_COL_W = [72, 68, 78, 60, 64];
+const DS_WINDOW = 2;     // days shown on screen, in the image and on the shared page
+const DS_CLEAN_DAY = 4;  // last month is cleared once the report date reaches this day
 const COD_BUCKET_KEYS = ['1', '2', '3', '4-5', '6-30', '>30'];
 const COD_BUCKET_LABELS = ['1 Days', '2 Days', '3 Days', '4-5 Days', '6-30 Days', '>30 Days'];
 // display columns: 6 FE buckets + FE total, then 6 Branch buckets + Branch total
@@ -609,6 +621,85 @@ function parseCodRows(rows, head) {
   return { kind: 'cod', codes, rows: total, noBranch };
 }
 
+/* ---- DS Performance raw-file parsing (see DS-Dashboard-Project-Reference.md for the rules) ---- */
+function dsBlankAgg() { return { total: 0, inTat: 0, sameDay: 0, attempt: 0, deliv: 0, delivVC: 0 }; }
+function dsTimeOfDay(v) {
+  if (v == null || v === '') return null;
+  if (v instanceof Date) { if (isNaN(v.getTime())) return null; return v.getHours() * 3600000 + v.getMinutes() * 60000 + v.getSeconds() * 1000; }
+  if (typeof v === 'number') { const frac = v - Math.floor(v); return Math.round(frac * 86400000); }
+  const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(String(v).trim());
+  return m ? ((+m[1]) * 3600 + (+m[2]) * 60 + (+(m[3] || 0))) * 1000 : null;
+}
+function dsDateSlug(ms) { const d = new Date(ms); return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0'); }
+
+function parseDsRows(rows, head) {
+  const col = n => head.indexOf(n.toLowerCase());
+  const C = {
+    awb: col('AWB NO'), fr: col('FRANCHISEE'), city: col('CITY'), cutoff: col('CUT-OFF CATEGORY'),
+    fa: col('FIRST ATTEMPT'), faDate: col('FIRST ATTEMPT DATE'), faTime: col('FIRST ATTEMPT TIME'),
+    sda: col('SAME DAY ATTEMPT'), deliv: col('DELIVERED'), undel: col('UNDELIVERED TYPE'),
+    ordDate: col('CALCULATED ORDER DATE'), ordTime: col('CALCULATED ORDER TIME'),
+    tatType: col('TAT TYPE'), hrs: col('HRS')
+  };
+  const S = v => (v == null ? '' : String(v).trim());
+
+  // One file = one report date, in practice (SOP \u00a72/\u00a77). If more than one CALCULATED ORDER DATE
+  // shows up, the file was pulled mid-day: the newest date is a partial cut of "today", so the
+  // report date is the previous complete calendar day, not the max date in the file.
+  const dateSet = {};
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    if (!S(row[C.awb])) continue;
+    const d = codParseDate(row[C.ordDate]);
+    if (d != null) dateSet[d] = true;
+  }
+  const distinctDates = Object.keys(dateSet).map(Number).sort((a, b) => a - b);
+  let reportDateMs = distinctDates.length ? distinctDates[distinctDates.length - 1] : null;
+  if (distinctDates.length > 1) reportDateMs -= 86400000;
+
+  const franchises = new Map();
+  let total = 0, excluded = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    total++;
+    if (!S(row[C.awb])) { excluded++; continue; }                       // \u00a73: universal exclusion
+    if (reportDateMs != null && codParseDate(row[C.ordDate]) !== reportDateMs) continue;
+    const name = S(row[C.fr]);
+    if (!name) continue;
+    const key = bkey(name);
+    let a = franchises.get(key);
+    if (!a) { a = { name, city: S(row[C.city]), before: dsBlankAgg(), overall: dsBlankAgg() }; franchises.set(key, a); }
+
+    const faYes = S(row[C.fa]) === 'Yes';
+    const sdaYes = S(row[C.sda]) === 'Yes';
+    const delivVal = S(row[C.deliv]);
+    const del = delivVal === 'Yes';
+    const delOrVC = del || (delivVal === 'No' && S(row[C.undel]) === 'Verified');
+    const tatType = S(row[C.tatType]);
+    let inTat = false;
+    if (tatType === 'Hrs') {
+      const ft = dsTimeOfDay(row[C.faTime]);
+      if (ft != null) {
+        const fd = codParseDate(row[C.faDate]), ot = dsTimeOfDay(row[C.ordTime]), od = codParseDate(row[C.ordDate]);
+        if (fd != null && ot != null && od != null) inTat = ((fd + ft) - (od + ot)) / 3600000 < (Number(row[C.hrs]) || 0);
+      }
+    } else if (tatType === 'Days') {
+      const fd = row[C.faDate] != null && S(row[C.faDate]) !== '' ? codParseDate(row[C.faDate]) : null;
+      if (fd != null) inTat = fd === codParseDate(row[C.ordDate]);
+    }
+
+    const bump = agg => {
+      agg.total++;
+      if (inTat) agg.inTat++;
+      if (sdaYes) agg.sameDay++;
+      if (faYes) { agg.attempt++; if (del) agg.deliv++; if (delOrVC) agg.delivVC++; }
+    };
+    bump(a.overall);
+    if (S(row[C.cutoff]) === 'Before cut-off') bump(a.before);
+  }
+  return { kind: 'ds', date: reportDateMs != null ? dsDateSlug(reportDateMs) : null, franchises, rows: total, excluded };
+}
+
 function parseAny(buf) {
   const names = XLSX.read(buf, { type: 'array', bookSheets: true }).SheetNames;
   const pick = names.indexOf('Detail') >= 0 ? 'Detail' : (names.indexOf('Sheet1') >= 0 ? 'Sheet1' : names[0]);
@@ -620,12 +711,13 @@ function parseAny(buf) {
   if (!rows.length) throw new Error('The sheet is empty.');
   const head = rows[0].map(h => String(h == null ? '' : h).trim().toLowerCase());
   const missing = list => list.filter(c => head.indexOf(c.toLowerCase()) < 0);
-  const mc = missing(COD_NEEDED), mp = missing(PERF_REQUIRED), mo = missing(OFD_REQUIRED);
+  const mc = missing(COD_NEEDED), mp = missing(PERF_REQUIRED), mo = missing(OFD_REQUIRED), md = missing(DS_REQUIRED);
   if (!mc.length) return parseCodRows(rows, head);
   if (!mp.length) return parsePerfRows(rows, head);
   if (!mo.length) return parseOfdRows(rows, head);
-  const opts = [{ n: 'COD Pendency', m: mc }, { n: 'Daily performance', m: mp }, { n: 'OFD', m: mo }].sort((a, b) => a.m.length - b.m.length);
-  throw new Error('Not recognised as an OFD, Daily performance or COD Pendency file. Closest match is ' + opts[0].n + ', missing: ' + opts[0].m.join(', '));
+  if (!md.length) return parseDsRows(rows, head);
+  const opts = [{ n: 'COD Pendency', m: mc }, { n: 'Daily performance', m: mp }, { n: 'OFD', m: mo }, { n: 'DS Performance', m: md }].sort((a, b) => a.m.length - b.m.length);
+  throw new Error('Not recognised as an OFD, Daily performance, COD Pendency or DS Performance file. Closest match is ' + opts[0].n + ', missing: ' + opts[0].m.join(', '));
 }
 
 /* ---- background workers ---- */
@@ -636,8 +728,10 @@ function getWorkerURL() {
   const lib = document.getElementById('xlsx-src').textContent;
   const code = lib + '\n;const OFD_REQUIRED=' + JSON.stringify(OFD_REQUIRED) + ',PERF_REQUIRED=' + JSON.stringify(PERF_REQUIRED) +
     ',PERF_DROP=' + JSON.stringify(PERF_DROP) + ',COD_REQUIRED=' + JSON.stringify(COD_REQUIRED) + ',COD_NEEDED=' + JSON.stringify(COD_NEEDED) +
+    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) +
     ';const bkey=' + bkey + ';const isY=' + isY + ';\n' +
-    parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' + parseAny + '\n' +
+    parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
+    dsBlankAgg + '\n' + dsTimeOfDay + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
     'self.onmessage=function(e){try{self.postMessage({ok:true,p:parseAny(e.data)});}catch(err){self.postMessage({ok:false,msg:String((err&&err.message)||err)});}};';
   workerURL = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   return workerURL;
@@ -676,6 +770,7 @@ function assign(file, zone) {
 const zoneFile = z => state.files.find(f => f.kind === 'ofd' && f.zone === z && f.branches);
 const perfFile = () => state.files.find(f => f.kind === 'perf' && f.perf);
 const codFile = () => state.files.find(f => f.kind === 'cod' && f.cod);
+const dsFile = () => state.files.find(f => f.kind === 'ds' && f.ds);
 
 async function processOne(f, rec) {
   try {
@@ -701,6 +796,13 @@ async function processOne(f, rec) {
       rec.cod = p; rec.rows = p.rows;
       applyCodFile();
       if (!state.picked) state.report = 'cod';
+    } else if (p.kind === 'ds') {
+      // one raw file at a time; each drop is one day and gets merged into the rolling history
+      state.files.filter(x => x !== rec && x.kind === 'ds').forEach(x => { state.files = state.files.filter(y => y !== x); });
+      rec.ds = p; rec.rows = p.rows;
+      if (!p.date) { toast(f.name + ': could not work out a report date from CALCULATED ORDER DATE.', true); }
+      applyDsFile();
+      if (!state.picked) state.report = 'ds';
     } else {
       rec.branches = p.branches; rec.rows = p.rows; rec.unassigned = p.unassigned;
       const z = detectZone(p.branches);
@@ -746,7 +848,7 @@ async function addFiles(fileList) {
   render();
 }
 
-const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : false;
+const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : false;
 
 
 /* ==========================================================================
@@ -1973,17 +2075,391 @@ function shareCodAllImages() { shareCodImages(COD_REGIONS); }
 
 
 /* ==========================================================================
+   DS PERFORMANCE REPORT  (franchisee SLA report, see DS-Dashboard-Project-Reference.md)
+   Like Daily performance: history persists across days in this browser, only the last
+   DS_WINDOW dates are shown, and a whole month's numbers can be downloaded as Excel.
+   Like OFD/COD: a franchisee code seen for the first time is included by best guess and
+   flagged, with a tray to confirm or reassign its zone, or exclude it as a test/dummy row.
+   ========================================================================== */
+const DS_HKEY = 'dsHistory', DS_CHKEY = 'dsChoices', DS_KNKEY = 'dsKnown';
+const DS_SEED_DELHI = ['Central Hub - 908', 'Chhatarpur - 958', 'East Delhi - 931', 'Faridabad-948', 'Ghaziabad-952',
+  'Greater Noida-944', 'HUMANYUPUR HUB-945', 'NAVYA ENTERPRISES-027', 'Nangloi Hub - 935', 'Noida Hub - 907',
+  'Okhla Hub-939', 'Om Swastik Logistics- 39', 'Palam - 961', 'Pickup Centre Mumbai', 'Salarpur Hub-946',
+  'Sarhaul GGN Hub-947', 'Transport Nagar - 934', 'West Hub - 906'];
+const DS_SEED_ZONEB = ['Agra-950', 'Amritsar-953', 'Dehradun-956', 'Jalandhar-954', 'Kanpur-951', 'Lucknow- 955', 'Meerut-949'];
+const DS_SEED_EXCLUDE = ['Test Delivey Centre', 'AALIYA ASSOCIATES-024'];   // known test/dummy rows, per SOP \u00a76
+
+let dsHistory = { days: {} };   // date -> { franchises: { key: {before:{...6 numbers}, overall:{...6 numbers}} } }
+let dsChoices = {};             // key -> 'delhi' | 'zoneb' | 'exclude' | null (undecided -> auto keyword rule)
+let dsKnown = {};                // key -> { name, city }, once seen (drives the NEW pill / tray)
+
+function dsSeedKnown() {
+  let changed = false;
+  const seed = (list, val) => list.forEach(n => { const k = bkey(n); if (!dsKnown[k]) { dsKnown[k] = { name: n, city: '' }; dsChoices[k] = val; changed = true; } });
+  seed(DS_SEED_DELHI, 'delhi'); seed(DS_SEED_ZONEB, 'zoneb'); seed(DS_SEED_EXCLUDE, 'exclude');
+  if (changed) { saveDsKnown(); saveDsChoices(); }
+}
+function loadDs() {
+  dsHistory = { days: {} }; dsChoices = {}; dsKnown = {};
+  try { const saved = JSON.parse(lsGet(nsKey(DS_HKEY)) || 'null'); if (saved && saved.days) dsHistory = saved; } catch (e) {}
+  try { const savedCh = JSON.parse(lsGet(nsKey(DS_CHKEY)) || 'null'); if (savedCh) dsChoices = savedCh; } catch (e) {}
+  try { const savedKn = JSON.parse(lsGet(nsKey(DS_KNKEY)) || 'null'); if (savedKn) dsKnown = savedKn; } catch (e) {}
+  dsSeedKnown();
+}
+function saveDsHistory() { lsSet(nsKey(DS_HKEY), JSON.stringify(dsHistory)); }
+function saveDsChoices() { lsSet(nsKey(DS_CHKEY), JSON.stringify(dsChoices)); }
+function saveDsKnown() { lsSet(nsKey(DS_KNKEY), JSON.stringify(dsKnown)); }
+function resetDsHistory() {
+  lsDel(nsKey(DS_HKEY)); lsDel(nsKey(DS_CHKEY)); lsDel(nsKey(DS_KNKEY));
+  loadDs(); render(); toast('Saved DS Performance data cleared');
+}
+function dsHasHistory() { return Object.keys(dsHistory.days).length > 0; }
+function dsLastDays(n) { return Object.keys(dsHistory.days).sort().slice(-n); }
+function dsCleanupOldMonth(latestDate) {
+  const d = new Date(latestDate + 'T00:00:00Z');
+  if (d.getUTCDate() < DS_CLEAN_DAY) return;
+  const curYM = monthOf(latestDate);
+  let removed = 0;
+  Object.keys(dsHistory.days).forEach(dt => { if (monthOf(dt) < curYM) { delete dsHistory.days[dt]; removed++; } });
+  if (removed) { saveDsHistory(); toast('Cleared last month\u2019s DS Performance data (past the ' + DS_CLEAN_DAY + 'th of the new month).'); }
+}
+
+function applyDsFile() {
+  const f = dsFile();
+  if (!f || !f.ds.date) return;
+  const date = f.ds.date;
+  const franchises = {};
+  f.ds.franchises.forEach((a, key) => {
+    franchises[key] = { before: a.before, overall: a.overall };
+    if (!dsKnown[key]) {
+      dsKnown[key] = { name: a.name, city: a.city };
+      if (dsIsTest(a.name)) dsChoices[key] = 'exclude';   // SOP \u00a76.3: excluded entirely by default, still shown in the tray
+    } else {
+      dsKnown[key].name = a.name; dsKnown[key].city = a.city;
+    }
+  });
+  dsHistory.days[date] = { franchises };
+  saveDsHistory(); saveDsChoices(); saveDsKnown();
+  dsCleanupOldMonth(date);
+}
+
+/* ---- zone classification (SOP \u00a75/\u00a76) ---- */
+function dsIsTest(name) { return /test/i.test(String(name || '')); }
+function dsDefaultZone(name) { return DS_ZONEB_RE.test(String(name || '')) ? 'Zone B' : 'Delhi NCR'; }
+function dsZoneFor(key) {
+  const ch = dsChoices[key];
+  if (ch === 'exclude') return null;
+  if (ch === 'delhi') return 'Delhi NCR';
+  if (ch === 'zoneb') return 'Zone B';
+  return dsDefaultZone((dsKnown[key] || {}).name);
+}
+function dsFreshKeys() { return Object.keys(dsKnown).filter(k => dsChoices[k] == null); }
+function dsSetChoice(key, val) { dsChoices[key] = val; saveDsChoices(); render(); }
+
+/* ---- metrics (SOP \u00a74) ---- */
+function dsMetricsFrom(agg) {
+  if (!agg) return null;
+  return [agg.total, safeDiv(agg.inTat, agg.total), safeDiv(agg.sameDay, agg.total), safeDiv(agg.deliv, agg.attempt), safeDiv(agg.delivVC, agg.attempt)];
+}
+function dsSumAgg(list) {
+  const t = { total: 0, inTat: 0, sameDay: 0, attempt: 0, deliv: 0, delivVC: 0 };
+  list.forEach(a => { if (!a) return; Object.keys(t).forEach(k => t[k] += a[k] || 0); });
+  return t;
+}
+function dsDay(zone, date) {
+  const day = dsHistory.days[date];
+  if (!day) return null;
+  const rows = [];
+  Object.keys(day.franchises).forEach(key => {
+    if (dsZoneFor(key) !== zone) return;
+    const f = day.franchises[key];
+    rows.push({ key, name: (dsKnown[key] || {}).name || key, before: dsMetricsFrom(f.before), overall: dsMetricsFrom(f.overall), _b: f.before, _o: f.overall });
+  });
+  rows.sort((a, b) => a.name.localeCompare(b.name));
+  return {
+    zone, date, rows,
+    totalBefore: dsMetricsFrom(dsSumAgg(rows.map(r => r._b))),
+    totalOverall: dsMetricsFrom(dsSumAgg(rows.map(r => r._o)))
+  };
+}
+function dsScales(rows, which) {
+  if (rows.length < 2) return null;
+  const out = {};
+  DS_PCT.forEach(c => {
+    const v = rows.map(r => r[which] && r[which][c]).filter(x => x != null).sort((a, b) => a - b);
+    if (v.length < 2) return;
+    const pos = (v.length - 1) * 0.5, lo = Math.floor(pos), hi = Math.ceil(pos);
+    out[c] = { min: v[0], mid: v[lo] + (v[hi] - v[lo]) * (pos - lo), max: v[v.length - 1] };
+  });
+  return out;
+}
+function dsFmtCell(i, v) { return v == null ? '\u2013' : (DS_PCT.includes(i) ? fmtPct(v) : fmtInt(v)); }
+
+/* ==========================================================================
+   SCREEN
+   ========================================================================== */
+function dsMultiTable(zone, dates, opts) {
+  opts = opts || {};
+  const days = dates.map(d => dsDay(zone, d));
+  const scales = days.map(d => d ? { before: dsScales(d.rows, 'before'), overall: dsScales(d.rows, 'overall') } : null);
+  const freshKeys = opts.static ? new Set() : new Set(dsFreshKeys());
+  let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm" rowspan="3">FRANCHISEE</th>' +
+    dates.map(dt => '<th colspan="10">' + esc(fmtDateLong(dt)) + '</th>').join('') + '</tr><tr>' +
+    dates.map(() => '<th colspan="5">BEFORE CUTOFF</th><th colspan="5">OVERALL (Before + After Cutoff)</th>').join('') + '</tr><tr>' +
+    dates.map(() => DS_LABELS.map(l => '<th>' + esc(l) + '</th>').join('') + DS_LABELS.map(l => '<th>' + esc(l) + '</th>').join('')).join('') +
+    '</tr></thead><tbody>';
+  const dataCells = (di, arr, which) => DS_LABELS.map((_, i) => {
+    const v = arr ? arr[i] : null;
+    const sc = scales[di] && scales[di][which];
+    const bg = sc && DS_PCT.includes(i) ? scaleColorPerf(v, sc[i]) : null;
+    return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + dsFmtCell(i, v) + '</td>';
+  }).join('');
+  const allKeys = new Map();
+  days.forEach(d => { if (d) d.rows.forEach(r => allKeys.set(r.key, r.name)); });
+  const names = Array.from(allKeys.entries()).sort((a, b) => a[1].localeCompare(b[1]));
+  names.forEach(([key, name]) => {
+    h += '<tr><td class="nm">' + esc(name) + (freshKeys.has(key) ? '<span class="pill">NEW</span>' : '') +
+      (opts.static ? '' : '<button class="x" data-dsrm="' + esc(key) + '" title="Exclude ' + esc(name) + '" aria-label="Exclude ' + esc(name) + '">&times;</button>') + '</td>';
+    days.forEach((d, di) => {
+      const row = d && d.rows.find(r => r.key === key);
+      h += dataCells(di, row ? row.before : null, 'before') + dataCells(di, row ? row.overall : null, 'overall');
+    });
+    h += '</tr>';
+  });
+  h += '<tr class="tot"><td class="nm">ZONE TOTAL</td>' + days.map((d, di) => dataCells(di, d ? d.totalBefore : null, 'before') + dataCells(di, d ? d.totalOverall : null, 'overall')).join('') + '</tr>';
+  h += '</tbody></table></div>';
+  return h;
+}
+
+function renderDs() {
+  const host = $('#results');
+  const dates = dsLastDays(DS_WINDOW);
+  if (!dates.length) { host.innerHTML = '<div class="panel"><div class="empty"><b>No DS Performance data yet</b>Drop today\u2019s raw dark-store export to see the tables.</div></div>'; return; }
+  const anyShare = canShareFiles();
+  const freshKeys = dsFreshKeys();
+  const hiddenKeys = Object.keys(dsChoices).filter(k => dsChoices[k] === 'exclude');
+
+  let html = '<div class="bar">' +
+    '<button class="btn primary" id="pubBtn" title="Update your shared link with these tables">Publish to link</button>' +
+    '<button class="btn" id="dlDsImg">Save image</button><button class="btn" id="cpDsImg">Copy image</button>' +
+    (anyShare ? '<button class="btn" id="shDsImg">Share&hellip;</button>' : '') +
+    '<button class="btn" id="dlDsExcel">Download month\u2019s Excel</button>' +
+    '<span class="sp"></span>' +
+    '<label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add date on images</label>' +
+    '</div>';
+
+  if (freshKeys.length) {
+    html += '<div class="newstrip"><p>' + (freshKeys.length === 1 ? 'New franchisee code' : freshKeys.length + ' new franchisee codes') +
+      ' seen for the first time \u2014 included for now using the automatic zone rule (SOP \u00a76). Confirm where each belongs.</p>' +
+      freshKeys.map(k => {
+        const nm = (dsKnown[k] || {}).name || k, z = dsZoneFor(k);
+        return '<div class="newrow"><span class="nm">' + esc(nm) + '</span><span class="ct">currently in: ' + esc(z) + '</span>' +
+          '<span class="ans">' + DS_ZONES.map(zz => '<button class="btn small" data-dsz="' + esc(k) + '|' + (zz === 'Delhi NCR' ? 'delhi' : 'zoneb') + '">' + (zz === z ? 'Keep in ' : 'Move to ') + esc(zz) + '</button>').join('') +
+          '<button class="btn small" data-dsex="' + esc(k) + '">Exclude (test/dummy)</button></span></div>';
+      }).join('') + '</div>';
+  }
+
+  html += DS_ZONES.map(zone => '<section class="panel" aria-label="' + esc(zone) + ' table"><div class="phead"><h2 style="width:100%;text-align:center">' + esc(zone) + '</h2></div>' + dsMultiTable(zone, dates) + '</section>').join('');
+
+  if (hiddenKeys.length) {
+    html += '<div class="tray"><p>Left out (' + hiddenKeys.length + ') \u2014 test/dummy entries or codes you excluded. Click to add back.</p><div class="chips">' +
+      hiddenKeys.map(k => '<button class="chip" data-dsadd="' + esc(k) + '">' + esc((dsKnown[k] || {}).name || k) + '</button>').join('') + '</div></div>';
+  }
+
+  host.innerHTML = html;
+  $('#pubBtn').onclick = startPublish;
+  $('#dlDsImg').onclick = () => saveDsImage(dates);
+  $('#cpDsImg').onclick = () => copyDsImage(dates);
+  if ($('#shDsImg')) $('#shDsImg').onclick = () => shareDsImages(dates);
+  $('#dlDsExcel').onclick = downloadDsExcel;
+  $('#optTitle').onchange = e => { state.showTitle = e.target.checked; };
+  host.querySelectorAll('[data-dsrm]').forEach(b => b.onclick = () => dsSetChoice(b.dataset.dsrm, 'exclude'));
+  host.querySelectorAll('[data-dsex]').forEach(b => b.onclick = () => dsSetChoice(b.dataset.dsex, 'exclude'));
+  host.querySelectorAll('[data-dsadd]').forEach(b => b.onclick = () => dsSetChoice(b.dataset.dsadd, dsDefaultZone((dsKnown[b.dataset.dsadd] || {}).name) === 'Zone B' ? 'zoneb' : 'delhi'));
+  host.querySelectorAll('[data-dsz]').forEach(b => b.onclick = () => { const p = b.dataset.dsz.split('|'); dsSetChoice(p[0], p[1]); });
+}
+
+/* ==========================================================================
+   IMAGE  (both zone tables stacked in one picture, matching the layout sent to others)
+   ========================================================================== */
+function drawDsAll(dates, withTitle) {
+  const zonesData = DS_ZONES.map(z => ({ zone: z, day: dates.map(d => dsDay(z, d)) }));
+  const S = 3, pad = 14, rowH = 24, headH = [22, 20, 34], zoneBandH = 28, gap = 22, colW = 58;
+  const mc = document.createElement('canvas').getContext('2d'); mc.font = '13px Arial, Helvetica, sans-serif';
+  let w0 = 190;
+  zonesData.forEach(zd => zd.day.forEach(d => { if (d) d.rows.forEach(r => { w0 = Math.max(w0, Math.ceil(mc.measureText(r.name).width) + 24); }); }));
+  const blockW = colW * 10, tableW = w0 + blockW * dates.length, headTotal = headH[0] + headH[1] + headH[2];
+  let H = pad * 2 + (withTitle ? 30 : 0);
+  const rowsCount = zonesData.map(zd => { const allKeys = new Set(); zd.day.forEach(d => { if (d) d.rows.forEach(r => allKeys.add(r.key)); }); return allKeys.size; });
+  zonesData.forEach((zd, zi) => { H += zoneBandH + headTotal + rowH * (rowsCount[zi] + 1) + gap; });
+  const W = tableW + pad * 2;
+
+  const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S;
+  const ctx = cv.getContext('2d'); ctx.scale(S, S);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); ctx.textBaseline = 'middle';
+  const cellBox = (x, y, w, h, fill) => { if (fill) { ctx.fillStyle = fill; ctx.fillRect(x, y, w, h); } ctx.strokeStyle = '#BFBFBF'; ctx.lineWidth = 1; ctx.strokeRect(x + .5, y + .5, w - 1, h - 1); };
+
+  let y = pad;
+  if (withTitle) {
+    ctx.fillStyle = '#141D26'; ctx.font = 'bold 18px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('DS Performance', pad, y + 14);
+    ctx.fillStyle = '#5B6773'; ctx.font = '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText(stampText(), W - pad, y + 15);
+    y += 30;
+  }
+
+  zonesData.forEach(zd => {
+    cellBox(pad, y, tableW, zoneBandH, '#31424F');
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 15px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(zd.zone, pad + tableW / 2, y + zoneBandH / 2 + 1);
+    y += zoneBandH;
+
+    let x = pad;
+    ctx.font = 'bold 11px Arial, Helvetica, sans-serif';
+    cellBox(x, y, w0, headTotal, '#D9E1F2'); ctx.fillStyle = '#000'; ctx.textAlign = 'center';
+    ctx.fillText('FRANCHISEE', x + w0 / 2, y + headTotal / 2 + 1); x += w0;
+    dates.forEach(dt => { cellBox(x, y, blockW, headH[0], '#D9E1F2'); ctx.fillStyle = '#000'; ctx.fillText(fmtDateLong(dt), x + blockW / 2, y + headH[0] / 2 + 1); x += blockW; });
+    let y1 = y + headH[0]; x = pad + w0;
+    dates.forEach(() => {
+      cellBox(x, y1, colW * 5, headH[1], '#D9E1F2'); ctx.fillStyle = '#000'; ctx.fillText('BEFORE CUTOFF', x + colW * 2.5, y1 + headH[1] / 2 + 1); x += colW * 5;
+      cellBox(x, y1, colW * 5, headH[1], '#D9E1F2'); ctx.fillText('OVERALL', x + colW * 2.5, y1 + headH[1] / 2 + 1); x += colW * 5;
+    });
+    let y2 = y1 + headH[1]; x = pad + w0;
+    dates.forEach(() => { [0, 1].forEach(() => DS_LABELS.forEach(l => {
+      cellBox(x, y2, colW, headH[2], '#D9E1F2'); ctx.fillStyle = '#000';
+      const lines = wrapLines(ctx, l, colW - 6), lh = 11, top = y2 + headH[2] / 2 - (lines.length * lh) / 2 + lh / 2;
+      lines.forEach((ln, j) => ctx.fillText(ln, x + colW / 2, top + j * lh));
+      x += colW;
+    })); });
+    y = y2 + headH[2];
+
+    const scales = zd.day.map(d => d ? { before: dsScales(d.rows, 'before'), overall: dsScales(d.rows, 'overall') } : null);
+    const allKeys = new Map();
+    zd.day.forEach(d => { if (d) d.rows.forEach(r => allKeys.set(r.key, r.name)); });
+    const names = Array.from(allKeys.entries()).sort((a, b) => a[1].localeCompare(b[1]));
+
+    const drawRow = (name, getPair, bold, fill) => {
+      let xx = pad;
+      cellBox(xx, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.font = (bold ? 'bold ' : '') + '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText(name, xx + 7, y + rowH / 2 + 1); xx += w0;
+      dates.forEach((dt, di) => {
+        const pair = getPair(di);
+        ['before', 'overall'].forEach(which => {
+          const arr = pair ? pair[which] : null;
+          DS_LABELS.forEach((_, i) => {
+            const v = arr ? arr[i] : null;
+            const sc = scales[di] && scales[di][which];
+            const bg = fill || (sc && DS_PCT.includes(i) ? scaleColorPerf(v, sc[i]) : null);
+            cellBox(xx, y, colW, rowH, bg);
+            ctx.fillStyle = '#000'; ctx.font = (bold ? 'bold ' : '') + '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText(dsFmtCell(i, v), xx + colW / 2, y + rowH / 2 + 1);
+            xx += colW;
+          });
+        });
+      });
+      y += rowH;
+    };
+    names.forEach(([key, name]) => drawRow(name, di => { const r = zd.day[di] && zd.day[di].rows.find(rr => rr.key === key); return r ? { before: r.before, overall: r.overall } : null; }, false, null));
+    drawRow('ZONE TOTAL', di => zd.day[di] ? { before: zd.day[di].totalBefore, overall: zd.day[di].totalOverall } : null, true, '#F2F2F2');
+    y += gap;
+  });
+  return cv;
+}
+function dsAllBlob(dates) {
+  if (!dates.length) return Promise.reject(new Error('Nothing to draw'));
+  const cv = drawDsAll(dates, state.showTitle);
+  return new Promise((res, rej) => cv.toBlob(b => b ? res(b) : rej(new Error('Image failed')), 'image/png'));
+}
+const dsImgName = () => 'DS_Performance_' + dateSlug() + '.png';
+async function saveDsImage(dates) { try { saveBlob(await dsAllBlob(dates), dsImgName()); toast('Saved ' + dsImgName()); } catch (e) { toast(e.message, true); } }
+async function copyDsImage(dates) {
+  try {
+    if (!(navigator.clipboard && window.ClipboardItem)) throw new Error('Copy is not supported here. Use Save image instead.');
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': dsAllBlob(dates) })]);
+    toast('Image copied. Paste it into WhatsApp.');
+  } catch (e) { toast(e.message && /supported/.test(e.message) ? e.message : 'Could not copy. Use Save image instead.', true); }
+}
+async function shareDsImages(dates) {
+  try {
+    const file = new File([await dsAllBlob(dates)], dsImgName(), { type: 'image/png' });
+    await navigator.share({ files: [file], title: 'DS Performance ' + stampText() });
+  } catch (e) { if (e.name !== 'AbortError') toast('Sharing was not possible. Use Save image instead.', true); }
+}
+
+/* ==========================================================================
+   EXCEL  (whole current month, not hidden; cleared automatically past the 4th of a new month)
+   ========================================================================== */
+async function downloadDsExcel() {
+  if (!dsHasHistory()) return;
+  try {
+    const wb = new ExcelJS.Workbook(); wb.created = new Date();
+    const thin = { style: 'thin', color: { argb: 'FFBFBFBF' } };
+    const border = { top: thin, left: thin, bottom: thin, right: thin };
+    const dates = Object.keys(dsHistory.days).sort();
+    DS_ZONES.forEach(zone => {
+      if (!dates.length) return;
+      const ws = wb.addWorksheet(zone, { views: [{ state: 'frozen', xSplit: 1, ySplit: 3 }] });
+      ws.getColumn(1).width = 30;
+      const allKeys = new Map();
+      dates.forEach(dt => { const d = dsDay(zone, dt); if (d) d.rows.forEach(r => allKeys.set(r.key, r.name)); });
+      const names = Array.from(allKeys.entries()).sort((a, b) => a[1].localeCompare(b[1]));
+      const rowOf = {}; let r = 4;
+      names.forEach(([k, nm]) => { ws.getCell(r, 1).value = nm; ws.getCell(r, 1).border = border; rowOf[k] = r; r++; });
+      const gtRow = r; ws.getCell(gtRow, 1).value = 'ZONE TOTAL'; ws.getCell(gtRow, 1).font = { bold: true }; ws.getCell(gtRow, 1).border = border;
+      const last = gtRow;
+
+      let col = 2;
+      dates.forEach(date => {
+        const d = dsDay(zone, date);
+        ws.mergeCells(1, col, 1, col + 9);
+        const hc = ws.getCell(1, col); hc.value = fmtDateLong(date); hc.font = { bold: true }; hc.alignment = { horizontal: 'center' };
+        hc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9E1F2' } };
+        ws.mergeCells(2, col, 2, col + 4); ws.mergeCells(2, col + 5, 2, col + 9);
+        const bc = ws.getCell(2, col); bc.value = 'BEFORE CUTOFF'; bc.font = { bold: true }; bc.alignment = { horizontal: 'center' }; bc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9E1F2' } };
+        const oc = ws.getCell(2, col + 5); oc.value = 'OVERALL'; oc.font = { bold: true }; oc.alignment = { horizontal: 'center' }; oc.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9E1F2' } };
+        [0, 1].forEach(half => DS_LABELS.forEach((l, i) => { const c = ws.getCell(3, col + half * 5 + i); c.value = l; c.font = { bold: true, size: 10 }; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9E1F2' } }; c.border = border; }));
+        const writeRow = (rr, before, overall, bold, fill) => {
+          [before, overall].forEach((arr, half) => DS_LABELS.forEach((_, i) => {
+            const v = arr ? arr[i] : null; const c = ws.getCell(rr, col + half * 5 + i);
+            c.value = v == null ? null : v; c.numFmt = DS_PCT.includes(i) ? '0%' : '#,##0'; c.border = border;
+            if (bold) c.font = { bold: true };
+            if (fill) c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fill } };
+          }));
+        };
+        if (d) d.rows.forEach(row => writeRow(rowOf[row.key], row.before, row.overall, false, null));
+        writeRow(gtRow, d ? d.totalBefore : null, d ? d.totalOverall : null, true, 'FFF2F2F2');
+        if (last >= 5) {
+          [0, 1].forEach(half => DS_PCT.forEach(i => {
+            const L = openpyxlCol(col + half * 5 + i);
+            ws.addConditionalFormatting({ ref: L + '4:' + L + last, rules: [{ type: 'colorScale', priority: 1, cfvo: [{ type: 'min' }, { type: 'percentile', value: 50 }, { type: 'max' }], color: [{ argb: 'FFF8696B' }, { argb: 'FFFFEB84' }, { argb: 'FF63BE7B' }] }] });
+          }));
+        }
+        col += 10;
+      });
+    });
+    const buf = await wb.xlsx.writeBuffer();
+    const name = 'DS_Performance_' + monthOf(dates[dates.length - 1] || dateSlug()) + '.xlsx';
+    saveBlob(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), name);
+    toast('Saved ' + name);
+  } catch (e) { console.error(e); toast('Excel could not be created: ' + e.message, true); }
+}
+
+
+/* ==========================================================================
    TOP-LEVEL RENDER
    ========================================================================== */
 function render() {
   renderReportTabs();
   if (state.report === 'ofd') { renderSlots(); renderHint(); renderFix(); renderOfd(); }
-  else { $('#slots').innerHTML = ''; $('#hint').innerHTML = ''; $('#fix').innerHTML = ''; state.report === 'perf' ? renderPerf() : renderCod(); }
+  else {
+    $('#slots').innerHTML = ''; $('#hint').innerHTML = ''; $('#fix').innerHTML = '';
+    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : renderDs();
+  }
   const rs = $('#foot-reset');
-  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : 'COD Pendency';
+  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : 'DS Performance';
   rs.innerHTML = '<button class="link" id="pubSettings">Publish settings</button> &nbsp; <button class="link" id="resetChoices">Forget saved ' + which + ' choices</button>' +
     (storageOK ? '' : ' <span>(this browser is not allowing saved settings)</span>');
-  $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : resetCodChoices(); };
+  $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : resetDsHistory(); };
   $('#pubSettings').onclick = () => showPubSetup();
 }
 
@@ -2327,6 +2803,7 @@ window.__tool = { state, pub, computeZone, computeCod, perfDay, perfHistory: () 
 loadChoices();
 loadPerf();
 loadCod();
+loadDs();
 loadPub();
 render();
 </script>
