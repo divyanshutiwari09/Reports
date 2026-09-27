@@ -299,7 +299,7 @@ const COD_NEEDED = COD_REQUIRED.concat(['Branch', 'FE Submit Date', 'Related Box
 
 /* ---- DS Performance (franchisee SLA report) ---- */
 const DS_REQUIRED = ['AWB NO', 'FRANCHISEE', 'CITY', 'CUT-OFF CATEGORY', 'FIRST ATTEMPT', 'FIRST ATTEMPT DATE',
-  'FIRST ATTEMPT TIME', 'SAME DAY ATTEMPT', 'DELIVERED', 'UNDELIVERED TYPE', 'CALCULATED ORDER DATE', 'CALCULATED ORDER TIME', 'TAT TYPE'];
+  'FIRST ATTEMPT TIME', 'SAME DAY ATTEMPT', 'DELIVERED', 'UNDELIVERED TYPE', 'CALCULATED ORDER DATE', 'CALCULATED ORDER TIME', 'TAT TYPE', 'EDD DATE'];
 const DS_ZONES = ['Delhi NCR', 'Zone B'];
 const DS_ZONEB_RE = /agra|amritsar|dehradun|jalandhar|kanpur|lucknow|meerut/i;
 const DS_LABELS = ['TOTAL COUNT', 'IN TAT SLA', 'SAME DAY SLA', 'FASR', 'DEL+VC'];
@@ -638,24 +638,25 @@ function parseDsRows(rows, head) {
     awb: col('AWB NO'), fr: col('FRANCHISEE'), city: col('CITY'), cutoff: col('CUT-OFF CATEGORY'),
     fa: col('FIRST ATTEMPT'), faDate: col('FIRST ATTEMPT DATE'), faTime: col('FIRST ATTEMPT TIME'),
     sda: col('SAME DAY ATTEMPT'), deliv: col('DELIVERED'), undel: col('UNDELIVERED TYPE'),
-    ordDate: col('CALCULATED ORDER DATE'), ordTime: col('CALCULATED ORDER TIME'),
+    ordDate: col('CALCULATED ORDER DATE'), ordTime: col('CALCULATED ORDER TIME'), eddDate: col('EDD DATE'),
     tatType: col('TAT TYPE'), hrs: col('HRS')
   };
   const S = v => (v == null ? '' : String(v).trim());
 
-  // One file = one report date, in practice (SOP \u00a72/\u00a77). If more than one CALCULATED ORDER DATE
-  // shows up, the file was pulled mid-day: the newest date is a partial cut of "today", so the
-  // report date is the previous complete calendar day, not the max date in the file.
-  const dateSet = {};
+  // Report date = whichever EDD DATE (expected delivery date) is the majority in the file - report
+  // against the day deliveries were DUE, not the day orders were placed. This only decides which rows
+  // belong to this report and which date slot they're filed under; the In TAT SLA formula below still
+  // runs on CALCULATED ORDER DATE/TIME exactly as before, since that's a separate, deliberate measure
+  // of how fast an order was attempted relative to when it was placed.
+  const dateCounts = {};
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r]; if (!row || !row.length) continue;
     if (!S(row[C.awb])) continue;
-    const d = codParseDate(row[C.ordDate]);
-    if (d != null) dateSet[d] = true;
+    const d = C.eddDate >= 0 ? codParseDate(row[C.eddDate]) : null;
+    if (d != null) dateCounts[d] = (dateCounts[d] || 0) + 1;
   }
-  const distinctDates = Object.keys(dateSet).map(Number).sort((a, b) => a - b);
-  let reportDateMs = distinctDates.length ? distinctDates[distinctDates.length - 1] : null;
-  if (distinctDates.length > 1) reportDateMs -= 86400000;
+  let reportDateMs = null, bestCount = -1;
+  Object.keys(dateCounts).forEach(k => { const n = Number(k); if (dateCounts[k] > bestCount) { bestCount = dateCounts[k]; reportDateMs = n; } });
 
   const franchises = new Map();
   let total = 0, excluded = 0;
@@ -663,7 +664,7 @@ function parseDsRows(rows, head) {
     const row = rows[r]; if (!row || !row.length) continue;
     total++;
     if (!S(row[C.awb])) { excluded++; continue; }                       // \u00a73: universal exclusion
-    if (reportDateMs != null && codParseDate(row[C.ordDate]) !== reportDateMs) continue;
+    if (reportDateMs != null && C.eddDate >= 0 && codParseDate(row[C.eddDate]) !== reportDateMs) continue;
     const name = S(row[C.fr]);
     if (!name) continue;
     const key = bkey(name);
@@ -2200,7 +2201,7 @@ function dsFmtCell(i, v) { return v == null ? '\u2013' : (DS_PCT.includes(i) ? f
    ========================================================================== */
 function dsMultiTable(zone, dates, opts) {
   opts = opts || {};
-  const days = dates.map(d => dsDay(zone, d));
+  const days = opts.days || dates.map(d => dsDay(zone, d));
   const scales = days.map(d => d ? { before: dsScales(d.rows, 'before'), overall: dsScales(d.rows, 'overall') } : null);
   const freshKeys = opts.static ? new Set() : new Set(dsFreshKeys());
   let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm" rowspan="3">FRANCHISEE</th>' +
@@ -2282,8 +2283,8 @@ function renderDs() {
 /* ==========================================================================
    IMAGE  (both zone tables stacked in one picture, matching the layout sent to others)
    ========================================================================== */
-function drawDsAll(dates, withTitle) {
-  const zonesData = DS_ZONES.map(z => ({ zone: z, day: dates.map(d => dsDay(z, d)) }));
+function drawDsAll(dates, withTitle, zonesDataOverride) {
+  const zonesData = zonesDataOverride || DS_ZONES.map(z => ({ zone: z, day: dates.map(d => dsDay(z, d)) }));
   const S = 3, pad = 14, rowH = 24, headH = [22, 20, 34], zoneBandH = 28, gap = 22, colW = 58;
   const mc = document.createElement('canvas').getContext('2d'); mc.font = '13px Arial, Helvetica, sans-serif';
   let w0 = 190;
@@ -2542,7 +2543,9 @@ function buildReportHTML() {
   const haveOfd = ZONES.some(z => zoneFile(z) && computeZone(z).shown.length);
   const havePerf = perfHasHistory();
   const haveCod = COD_REGIONS.some(r => { const c = computeCod(r); return c && c.sections.length; });
-  if (!haveOfd && !havePerf && !haveCod) return null;
+  const dsDates = dsHasHistory() ? dsLastDays(DS_WINDOW) : [];
+  const haveDs = dsDates.length > 0;
+  if (!haveOfd && !havePerf && !haveCod && !haveDs) return null;
 
   const css = ':root{--ink:#141D26;--muted:#5B6773;--rule:#CBD3DB;--accent:#1F4E9E;--hdr:#D9E1F2;--ground:#E9EDF1}' +
     '*{box-sizing:border-box}body{margin:0;background:var(--ground);color:var(--ink);font:15px/1.45 "Bahnschrift","DIN Alternate","Avenir Next","Segoe UI",system-ui,-apple-system,Roboto,sans-serif}' +
@@ -2557,7 +2560,7 @@ function buildReportHTML() {
     '.note{margin:0;padding:10px 16px;color:var(--muted);font-size:13.5px;border-top:1.5px solid var(--rule)}[hidden]{display:none!important}.rsec{margin-top:6px}' +
     '.grid td.subtot{font-weight:600;background:#F7F9FB}';
 
-  let ofdData = null, perfData = null, codData = null;
+  let ofdData = null, perfData = null, codData = null, dsData = null;
   if (haveOfd) {
     const zs = ZONES.filter(z => zoneFile(z) && computeZone(z).shown.length);
     ofdData = zs.map((z, i) => ({ id: 'oz' + i, zone: z, d: computeZone(z) }));
@@ -2571,20 +2574,25 @@ function buildReportHTML() {
   if (haveCod) {
     codData = COD_REGIONS.filter(r => { const c = computeCod(r); return c && c.sections.length; }).map((r, i) => ({ id: 'cr' + i, region: r, d: computeCod(r) }));
   }
+  if (haveDs) {
+    dsData = DS_ZONES.map(zone => ({ zone, days: dsDates.map(dt => dsDay(zone, dt)) }));
+  }
   const runtimeData = {
     stamp: stampText(), showTitle: state.showTitle,
     ofd: ofdData ? ofdData.map(x => ({ zone: x.zone, file: ofdImgName(x.zone), shown: x.d.shown.map(r => ({ cells: r.cells })), total: { cells: x.d.total.cells, fb: x.d.total.fb }, scales: x.d.scales })) : null,
     perf: perfData ? perfData.map(x => ({ view: x.view, dates: x.dates.map(dt => ({ date: dt, file: perfImgName(x.view, dt), day: perfDay(x.view, dt) })) })) : null,
-    cod: codData ? codData.map(x => ({ region: x.region, file: codImgName(x.region), d: x.d })) : null
+    cod: codData ? codData.map(x => ({ region: x.region, file: codImgName(x.region), d: x.d })) : null,
+    ds: dsData ? { dates: dsDates, file: dsImgName(), zones: dsData } : null
   };
 
   const drawSrc = 'const HEADERS=' + JSON.stringify(HEADERS) + ',COL_W=' + JSON.stringify(COL_W) + ',PCT_COLS=' + JSON.stringify(PCT_COLS) +
     ',PERF_LABELS=' + JSON.stringify(PERF_LABELS) + ',PERF_PCT=' + JSON.stringify(PERF_PCT) + ',PERF_COL_W=' + JSON.stringify(PERF_COL_W) +
     ',RED=' + JSON.stringify(RED) + ',YEL=' + JSON.stringify(YEL) + ',GRN=' + JSON.stringify(GRN) +
-    ',COD_LABELS=' + JSON.stringify(COD_LABELS) + ',COD_GROUPS=' + JSON.stringify(COD_GROUPS) + ',COD_COL_W=' + JSON.stringify(COD_COL_W) + ';' +
+    ',COD_LABELS=' + JSON.stringify(COD_LABELS) + ',COD_GROUPS=' + JSON.stringify(COD_GROUPS) + ',COD_COL_W=' + JSON.stringify(COD_COL_W) +
+    ',DS_LABELS=' + JSON.stringify(DS_LABELS) + ',DS_PCT=' + JSON.stringify(DS_PCT) + ';' +
     'const MON=' + JSON.stringify(MON) + ';const fmtInt=' + fmtInt + ';const fmtPct=' + fmtPct + ';const fmtDateLong=' + fmtDateLong + ';' +
     'var DATA=' + jsonForScript(runtimeData) + ';const stampText=function(){return DATA.stamp};\n' +
-    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod].join('\n');
+    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll].join('\n');
 
   const uiSrc = '(function(){' +
     'var rt=[].slice.call(document.querySelectorAll("[data-rtab]")),rs=[].slice.call(document.querySelectorAll(".rsec"));' +
@@ -2600,6 +2608,8 @@ function buildReportHTML() {
     '[].slice.call(document.querySelectorAll("[data-pimg-v]")).forEach(function(b){b.onclick=function(){var vi=+b.dataset.pimgV,date=b.dataset.pimgD;perfBlobAt(vi,date).then(function(bl){saveAs(bl,DATA.perf[vi].dates.filter(function(x){return x.date===date})[0].file)})}});' +
     'function codBlobAt(i){var c=DATA.cod[i];var cv=drawCod(c.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-cimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.cimg;codBlobAt(i).then(function(bl){saveAs(bl,DATA.cod[i].file)})}});' +
+    'function dsBlob(){var cv=drawDsAll(DATA.ds.dates,DATA.showTitle,DATA.ds.zones.map(function(z){return {zone:z.zone,day:z.days}}));return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
+    '[].slice.call(document.querySelectorAll("[data-dsimg]")).forEach(function(b){b.onclick=function(){dsBlob().then(function(bl){saveAs(bl,DATA.ds.file)})}});' +
     '})();';
 
   let body = '<div class="wrap"><h1>Daily reports</h1><p class="up">Updated ' + esc(stampText()) + '</p>';
@@ -2607,6 +2617,7 @@ function buildReportHTML() {
   if (haveOfd) rtabs.push(['ofd', 'OFD dashboard']);
   if (havePerf) rtabs.push(['perf', 'Daily performance']);
   if (haveCod) rtabs.push(['cod', 'COD Pendency']);
+  if (haveDs) rtabs.push(['ds', 'DS Performance']);
   if (rtabs.length > 1) body += '<div class="tabs" role="group" aria-label="Report">' + rtabs.map(([id, n]) => '<button type="button" data-rtab="' + id + '" aria-pressed="false">' + esc(n) + '</button>').join('') + '</div>';
 
   if (haveOfd) {
@@ -2642,6 +2653,12 @@ function buildReportHTML() {
       body += '<section data-sec="' + x.id + '" class="panel" hidden><div class="ph"><h2>' + esc(x.region) + '</h2><button type="button" data-cimg="' + i + '">Save as image</button></div>' +
         codStaticTable(x.d, { static: true }) + '</section>';
     });
+    body += '</div>';
+  }
+  if (haveDs) {
+    body += '<div class="rsec" id="r-ds"' + (rtabs.length > 1 ? ' hidden' : '') + '>';
+    body += '<div class="ph"><h2>DS Performance</h2><button type="button" data-dsimg>Save as image</button></div>';
+    body += dsData.map(x => '<section class="panel"><div class="ph"><h2 style="width:100%;text-align:center">' + esc(x.zone) + '</h2></div>' + dsMultiTable(x.zone, dsDates, { static: true, days: x.days }) + '</section>').join('');
     body += '</div>';
   }
   body += '</div>';
