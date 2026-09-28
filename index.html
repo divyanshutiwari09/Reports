@@ -551,7 +551,14 @@ function parsePerfRows(rows, head) {
    run_report.py's bucket_from_diff / days-diff logic. */
 function codParseDate(v) {
   if (v == null || v === '') return null;
-  if (v instanceof Date) { if (isNaN(v.getTime())) return null; return Date.UTC(v.getFullYear(), v.getMonth(), v.getDate()); }
+  if (v instanceof Date) {
+    if (isNaN(v.getTime())) return null;
+    // The spreadsheet library builds date cells in the browser's local zone using historical zone rules, so in some
+    // zones (e.g. India) a date-only cell arrives a few seconds BEFORE local midnight, i.e. on the previous day.
+    // A value within 2 minutes of the next midnight is really that next day.
+    const secs = v.getHours() * 3600 + v.getMinutes() * 60 + v.getSeconds();
+    return Date.UTC(v.getFullYear(), v.getMonth(), v.getDate()) + (secs >= 86400 - 120 ? 86400000 : 0);
+  }
   if (typeof v === 'number') {                              // Excel serial, in case cellDates didn't convert it
     const ms = Math.round((v - 25569) * 86400 * 1000);
     const d = new Date(ms); if (isNaN(d.getTime())) return null;
