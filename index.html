@@ -257,7 +257,8 @@ const REPORTS = [
   { id: 'ofd',  name: 'OFD dashboard' },
   { id: 'perf', name: 'Daily performance' },
   { id: 'cod',  name: 'COD Pendency' },
-  { id: 'ds',   name: 'DS Performance' }
+  { id: 'ds',   name: 'DS Performance' },
+  { id: 'dso',  name: 'DS OFD' }
 ];
 
 /* ---- OFD report ---- */
@@ -305,6 +306,7 @@ const DS_ZONEB_RE = /agra|amritsar|dehradun|jalandhar|kanpur|lucknow|meerut/i;
 const DS_LABELS = ['TOTAL COUNT', 'IN TAT SLA', 'SAME DAY SLA', 'FASR', 'DEL+VC'];
 const DS_PCT = [1, 2, 3, 4];
 const DS_COL_W = [72, 68, 78, 60, 64];
+const DSO_EXTRA = ['STATUS', 'PACKED', 'OFD', 'ATTEMPT COMPLIANCE', 'EDD TIME'];
 const DS_WINDOW = 2;     // days shown on screen, in the image and on the shared page
 const DS_CLEAN_DAY = 4;  // last month is cleared once the report date reaches this day
 const COD_BUCKET_KEYS = ['1', '2', '3', '4-5', '6-30', '>30'];
@@ -335,6 +337,7 @@ const state = {
   sel: 'DELHI NDD',   // OFD zone on screen
   pview: 'DELHI NDD', // performance view on screen
   cregion: 'DELHI',   // COD Pendency region on screen
+  dsoTab: 'delhi',    // DS OFD tab on screen
   showTitle: true,
   showFix: false,
   batch: 0,
@@ -708,7 +711,59 @@ function parseDsRows(rows, head) {
   return { kind: 'ds', date: reportDateMs != null ? dsDateSlug(reportDateMs) : null, franchises, rows: total, excluded };
 }
 
-function parseAny(buf) {
+/* ---- DS OFD (same raw file as DS Performance; a live snapshot for 12pm / 3pm / 6pm sends) ---- */
+function dsoStamp(name) {
+  // the download date and time come from the raw file's own name, e.g. ..._2026-09-26T18_02_08_..._05_30.xlsx
+  const m = /(\d{4})-(\d{2})-(\d{2})T(\d{2})_(\d{2})_(\d{2})/.exec(String(name || ''));
+  if (m) return { todayMs: Date.UTC(+m[1], +m[2] - 1, +m[3]), min: (+m[4]) * 60 + (+m[5]), iso: m[1] + '-' + m[2] + '-' + m[3], hh: +m[4], mm: +m[5], fromName: true };
+  const n = new Date();
+  return { todayMs: Date.UTC(n.getFullYear(), n.getMonth(), n.getDate()), min: n.getHours() * 60 + n.getMinutes(),
+    iso: n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0') + '-' + String(n.getDate()).padStart(2, '0'), hh: n.getHours(), mm: n.getMinutes(), fromName: false };
+}
+// Which report does a raw file belong to? Decided by the file's own EDD date against its download date.
+//   EDD is today (or later)  -> a live same-day file  -> DS OFD only (never enters DS Performance history)
+//   EDD is an earlier day    -> a finished day        -> DS Performance only
+function dsRoute(p, name) {
+  const dl = dsoStamp(name).iso;
+  if (p.date && p.date >= dl) return p.ofd ? 'ofd' : 'ofd-missing';
+  return 'perf';
+}
+function dsoBlank() { return { total: 0, att: 0, breach: 0, pack: 0, onTime: 0, sda: 0, nonOfd: 0, inOfd: 0, del: 0 }; }
+function parseDsOfdRows(rows, head, st) {
+  const col = n => head.indexOf(n.toLowerCase());
+  const C = { fr: col('FRANCHISEE'), status: col('STATUS'), fa: col('FIRST ATTEMPT'), eddDate: col('EDD DATE'), eddTime: col('EDD TIME'),
+    packed: col('PACKED'), comp: col('ATTEMPT COMPLIANCE'), sda: col('SAME DAY ATTEMPT'), ofd: col('OFD'), del: col('DELIVERED'), cutoff: col('CUT-OFF CATEGORY') };
+  const S = v => (v == null ? '' : String(v).trim());
+  const cutMs = st.min * 60000;
+  const hubs = new Map();
+  let total = 0, skipped = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    total++;
+    if (S(row[C.status]) === '') { skipped++; continue; }              // blank STATUS rows are left out
+    const name = S(row[C.fr]); if (!name) continue;
+    const key = bkey(name);
+    let h = hubs.get(key);
+    if (!h) { h = { name, all: dsoBlank(), before: dsoBlank() }; hubs.set(key, h); }
+    const fa = S(row[C.fa]), sda = S(row[C.sda]), ofd = S(row[C.ofd]);
+    let breach = false;
+    if (fa === 'No' && codParseDate(row[C.eddDate]) === st.todayMs) { const t = dsTimeOfDay(row[C.eddTime]); breach = t != null && t <= cutMs; }
+    const bump = a => {
+      a.total++;
+      if (fa === 'Yes') a.att++;
+      if (breach) a.breach++;
+      if (S(row[C.packed]) === 'No') a.pack++;
+      if (S(row[C.comp]) === 'Yes') a.onTime++;
+      if (sda === 'Yes') { a.sda++; if (S(row[C.del]) === 'Yes') a.del++; }
+      else if (sda === 'No') { if (ofd === 'No') a.nonOfd++; else if (ofd === 'Yes') a.inOfd++; }
+    };
+    bump(h.all);
+    if (S(row[C.cutoff]) === 'Before cut-off') bump(h.before);
+  }
+  return { date: st.iso, hh: st.hh, mm: st.mm, fromName: st.fromName, hubs, rows: total, skipped };
+}
+
+function parseAny(buf, name) {
   const names = XLSX.read(buf, { type: 'array', bookSheets: true }).SheetNames;
   const pick = names.indexOf('Detail') >= 0 ? 'Detail' : (names.indexOf('Sheet1') >= 0 ? 'Sheet1' : names[0]);
   if (!pick) throw new Error('No sheet found in this file.');
@@ -723,7 +778,11 @@ function parseAny(buf) {
   if (!mc.length) return parseCodRows(rows, head);
   if (!mp.length) return parsePerfRows(rows, head);
   if (!mo.length) return parseOfdRows(rows, head);
-  if (!md.length) return parseDsRows(rows, head);
+  if (!md.length) {
+    const r = parseDsRows(rows, head);
+    if (!missing(DSO_EXTRA).length) r.ofd = parseDsOfdRows(rows, head, dsoStamp(name));
+    return r;
+  }
   const opts = [{ n: 'COD Pendency', m: mc }, { n: 'Daily performance', m: mp }, { n: 'OFD', m: mo }, { n: 'DS Performance', m: md }].sort((a, b) => a.m.length - b.m.length);
   throw new Error('Not recognised as an OFD, Daily performance, COD Pendency or DS Performance file. Closest match is ' + opts[0].n + ', missing: ' + opts[0].m.join(', '));
 }
@@ -736,21 +795,21 @@ function getWorkerURL() {
   const lib = document.getElementById('xlsx-src').textContent;
   const code = lib + '\n;const OFD_REQUIRED=' + JSON.stringify(OFD_REQUIRED) + ',PERF_REQUIRED=' + JSON.stringify(PERF_REQUIRED) +
     ',PERF_DROP=' + JSON.stringify(PERF_DROP) + ',COD_REQUIRED=' + JSON.stringify(COD_REQUIRED) + ',COD_NEEDED=' + JSON.stringify(COD_NEEDED) +
-    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) +
+    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) +
     ';const bkey=' + bkey + ';const isY=' + isY + ';\n' +
     parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
-    dsBlankAgg + '\n' + dsTimeOfDay + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
-    'self.onmessage=function(e){try{self.postMessage({ok:true,p:parseAny(e.data)});}catch(err){self.postMessage({ok:false,msg:String((err&&err.message)||err)});}};';
+    dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
+    'self.onmessage=function(e){try{self.postMessage({ok:true,p:parseAny(e.data.buf,e.data.name)});}catch(err){self.postMessage({ok:false,msg:String((err&&err.message)||err)});}};';
   workerURL = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   return workerURL;
 }
-function parseInWorker(buf) {
+function parseInWorker(buf, name) {
   return new Promise((resolve, reject) => {
     let w;
     try { w = new Worker(getWorkerURL()); } catch (e) { reject({ fallback: true }); return; }
     w.onmessage = ev => { w.terminate(); ev.data.ok ? resolve(ev.data.p) : reject({ msg: ev.data.msg }); };
     w.onerror = () => { w.terminate(); reject({ fallback: true }); };
-    w.postMessage(buf, [buf]);
+    w.postMessage({ buf, name }, [buf]);
   });
 }
 
@@ -783,9 +842,9 @@ const dsFile = () => state.files.find(f => f.kind === 'ds' && f.ds);
 async function processOne(f, rec) {
   try {
     let p;
-    try { p = await parseInWorker(await f.arrayBuffer()); }
+    try { p = await parseInWorker(await f.arrayBuffer(), f.name); }
     catch (e) {
-      if (e && e.fallback) { ensureXLSX(); p = parseAny(await f.arrayBuffer()); }
+      if (e && e.fallback) { ensureXLSX(); p = parseAny(await f.arrayBuffer(), f.name); }
       else throw new Error((e && e.msg) || 'could not be read');
     }
     rec.busy = false;
@@ -805,12 +864,24 @@ async function processOne(f, rec) {
       applyCodFile();
       if (!state.picked) state.report = 'cod';
     } else if (p.kind === 'ds') {
-      // one raw file at a time; each drop is one day and gets merged into the rolling history
-      state.files.filter(x => x !== rec && x.kind === 'ds').forEach(x => { state.files = state.files.filter(y => y !== x); });
-      rec.ds = p; rec.rows = p.rows;
-      if (!p.date) { toast(f.name + ': could not work out a report date from CALCULATED ORDER DATE.', true); }
-      applyDsFile();
-      if (!state.picked) state.report = 'ds';
+      const route = dsRoute(p, f.name);
+      if (route === 'ofd') {
+        // same-day file: feeds DS OFD only. Kept as its own kind so a later previous-day file never clears it.
+        rec.kind = 'dso'; rec.dso = p.ofd; rec.rows = p.rows;
+        state.files.filter(x => x !== rec && x.kind === 'dso').forEach(x => { state.files = state.files.filter(y => y !== x); });
+        toast(f.name + ': orders are for today (' + fmtDateLong(p.date) + '), so it went to DS OFD only, not DS Performance.');
+        if (!state.picked) state.report = 'dso';
+      } else if (route === 'ofd-missing') {
+        throw new Error('this looks like a same-day file (EDD ' + fmtDateLong(p.date) + ') but is missing columns DS OFD needs: ' + DSO_EXTRA.join(', ') + '. It was not added to DS Performance.');
+      } else {
+        // previous-day file: feeds DS Performance only (rolling history), not DS OFD
+        state.files.filter(x => x !== rec && x.kind === 'ds').forEach(x => { state.files = state.files.filter(y => y !== x); });
+        rec.ds = p; rec.rows = p.rows;
+        if (!p.date) { toast(f.name + ': could not work out a report date from EDD DATE.', true); }
+        applyDsFile();
+        toast(f.name + ': orders are for ' + fmtDateLong(p.date) + ' (a finished day), so it went to DS Performance only.');
+        if (!state.picked) state.report = 'ds';
+      }
     } else {
       rec.branches = p.branches; rec.rows = p.rows; rec.unassigned = p.unassigned;
       const z = detectZone(p.branches);
@@ -856,7 +927,7 @@ async function addFiles(fileList) {
   render();
 }
 
-const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : false;
+const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : false;
 
 
 /* ==========================================================================
@@ -2454,6 +2525,255 @@ async function downloadDsExcel() {
 
 
 /* ==========================================================================
+   DS OFD REPORT  (Delhi / Zone B, sent at 12pm, 3pm and 6pm)
+   Same raw file as DS Performance. Each drop is a live snapshot for the time in the file's own
+   name (no history). Hubs are listed alphabetically. Like OFD/COD, a hub can be left out or
+   added back; that choice is remembered between visits. Zones follow the DS Performance rule.
+   ========================================================================== */
+const DSO_CH_KEY = 'dso-choices-v1';
+const DSO_TABS = [{ id: 'delhi', name: 'Delhi', zone: 'Delhi NCR' }, { id: 'zoneb', name: 'Zone B', zone: 'Zone B' }];
+const DSO_HEAD = ['Branch', 'Total Orders', 'Total Attempted', 'Attempted + EDD Breach', 'Pending for Packing', 'On Time Attempt',
+  'Same Day Attempt', 'Non OFD', 'In OFD', 'Delivered', 'Attempt Compliance', 'Same Day Attempt', 'FASR'];
+const DSO_PCTV = [9, 10, 11];                      // percentage columns, counted after the hub name
+const DSO_COL_W = [66, 70, 92, 72, 70, 72, 58, 58, 70, 80, 64, 60];
+const DSO_SECTIONS = [{ k: 'all', title: 'Before+After Cutoff Orders' }, { k: 'before', title: 'Before Cutoff Orders' }];
+// the 12 Delhi hubs in the current Excel report; the other Delhi-NCR codes start "left out" (click to add back)
+const DSO_LEFT_OUT = ['Greater Noida-944', 'Palam-961', 'Salarpur Hub-946', 'NAVYA ENTERPRISES-027', 'Om Swastik Logistics- 39', 'Pickup Centre Mumbai'];
+let dsoChoices = {};     // hubKey -> 'in' | 'out'
+
+function loadDso() {
+  dsoChoices = {};
+  try { const s = JSON.parse(lsGet(nsKey(DSO_CH_KEY)) || 'null'); if (s) dsoChoices = s; } catch (e) {}
+}
+function saveDsoChoices() { lsSet(nsKey(DSO_CH_KEY), JSON.stringify(dsoChoices)); }
+function resetDsoChoices() { lsDel(nsKey(DSO_CH_KEY)); loadDso(); render(); toast('Saved DS OFD hub choices cleared'); }
+function dsoSetChoice(key, val) { dsoChoices[key] = val; saveDsoChoices(); render(); }
+const dsoFile = () => state.files.find(f => f.kind === 'dso' && f.dso);
+const dsoRoster = () => new Set(DS_SEED_DELHI.concat(DS_SEED_ZONEB, DS_SEED_EXCLUDE).map(bkey));
+const dsoLeftOut = () => new Set(DSO_LEFT_OUT.map(bkey));
+function dsoIn(key) { const c = dsoChoices[key]; return c ? c === 'in' : !dsoLeftOut().has(key); }
+function dsoZoneOf(key, name) {
+  const ch = dsChoices[key];
+  if (ch === 'exclude') return null;                         // test/dummy codes stay out everywhere
+  if (ch === 'delhi') return 'Delhi NCR';
+  if (ch === 'zoneb') return 'Zone B';
+  return dsDefaultZone(name);
+}
+function dsoVals(a) {
+  const ap = a.att + a.breach;
+  return [a.total, a.att, ap, a.pack, a.onTime, a.sda, a.nonOfd, a.inOfd, a.del,
+    ap ? a.onTime / ap : 0, a.total ? a.sda / a.total : 0, a.sda ? a.del / a.sda : 0];
+}
+function dsoStampLabel(o) {
+  const h = o.hh % 12 || 12;
+  return fmtDateLong(o.date) + ', ' + h + ':' + String(o.mm).padStart(2, '0') + ' ' + (o.hh >= 12 ? 'pm' : 'am');
+}
+function dsoScales(valsList) {
+  const out = {};
+  DSO_PCTV.forEach(c => {
+    const v = valsList.map(x => x[c]).filter(x => x != null).sort((a, b) => a - b);
+    if (v.length < 2) return;
+    const pos = (v.length - 1) * 0.5, lo = Math.floor(pos), hi = Math.ceil(pos);
+    out[c] = { min: v[0], mid: v[lo] + (v[hi] - v[lo]) * (pos - lo), max: v[v.length - 1] };
+  });
+  return out;
+}
+function computeDso(tabId) {
+  const f = dsoFile(); if (!f) return null;
+  const tab = DSO_TABS.find(t => t.id === tabId) || DSO_TABS[0];
+  const o = f.dso, ros = dsoRoster();
+  const shown = [], hidden = [], fresh = [];
+  o.hubs.forEach((h, key) => {
+    if (dsoZoneOf(key, h.name) !== tab.zone) return;
+    const item = { key, name: h.name, all: h.all, before: h.before };
+    if (dsoIn(key)) { shown.push(item); if (!(key in dsoChoices) && !ros.has(key)) fresh.push(item); } else hidden.push(item);
+  });
+  const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true });
+  shown.sort(byName); hidden.sort(byName); fresh.sort(byName);
+  const sections = DSO_SECTIONS.map(s => {
+    const rows = shown.filter(h => h[s.k].total > 0).map(h => ({ key: h.key, name: h.name, vals: dsoVals(h[s.k]) }));
+    const t = dsoBlank(); rows.forEach(r => { const a = shown.find(h => h.key === r.key)[s.k]; Object.keys(t).forEach(k => { t[k] += a[k]; }); });
+    const total = dsoVals(t);
+    return { k: s.k, title: s.title, rows, total, scales: rows.length ? dsoScales(rows.map(r => r.vals).concat([total])) : {} };
+  });
+  return { tab: { id: tab.id, name: tab.name }, stampLabel: dsoStampLabel(o), sections, hidden: hidden.map(h => ({ key: h.key, name: h.name, n: h.all.total })), fresh: fresh.map(h => ({ key: h.key, name: h.name, n: h.all.total })) };
+}
+function dsoFmt(i, v) { return v == null ? '\u2013' : (DSO_PCTV.includes(i) ? fmtPct(v) : fmtInt(v)); }
+
+function dsoTableHTML(d, opts) {
+  opts = opts || {};
+  const fresh = new Set(d.fresh.map(x => x.key));
+  return d.sections.map(s => {
+    let h = '<div style="background:#FFFF00;color:#000;font-weight:700;text-align:center;padding:7px;border-top:1px solid #BFBFBF;border-bottom:1px solid #BFBFBF">' + esc(s.title) + '</div>' +
+      '<div class="scroller"><table class="grid"><thead><tr>' + DSO_HEAD.map((x, i) => '<th' + (i === 0 ? ' class="nm"' : '') + '>' + esc(x) + '</th>').join('') + '</tr></thead><tbody>';
+    s.rows.forEach(r => {
+      h += '<tr><td class="nm">' + esc(r.name) + (!opts.static && fresh.has(r.key) ? '<span class="pill">NEW</span>' : '') +
+        (opts.static ? '' : '<button class="x" data-dorm="' + esc(r.key) + '" title="Leave out ' + esc(r.name) + '" aria-label="Leave out ' + esc(r.name) + '">&times;</button>') + '</td>' +
+        r.vals.map((v, i) => { const bg = DSO_PCTV.includes(i) ? scaleColorPerf(v, s.scales[i]) : null; return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + dsoFmt(i, v) + '</td>'; }).join('') + '</tr>';
+    });
+    h += '<tr class="tot"><td class="nm">Grand Total</td>' + s.total.map((v, i) => { const bg = DSO_PCTV.includes(i) ? scaleColorPerf(v, s.scales[i]) : null; return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + dsoFmt(i, v) + '</td>'; }).join('') + '</tr>';
+    return h + '</tbody></table></div>';
+  }).join('<div style="height:12px"></div>');
+}
+
+function renderDso() {
+  const host = $('#results');
+  const f = dsoFile();
+  if (!f) {
+    host.innerHTML = '<div class="panel"><div class="empty"><b>No DS OFD data yet</b>Drop today\u2019s raw dark-store export (the one whose EDD is today). Previous-day files go to DS Performance instead.</div></div>';
+    return;
+  }
+  if (!DSO_TABS.some(t => t.id === state.dsoTab)) state.dsoTab = 'delhi';
+  const d = computeDso(state.dsoTab), anyShare = canShareFiles();
+  let html = '<div class="bar">' +
+    '<button class="btn primary" id="pubBtn" title="Update your shared link with these tables">Publish to link</button>' +
+    '<button class="btn" id="dlDsoAll">Save both images</button>' +
+    (anyShare ? '<button class="btn" id="shDsoAll">Share both&hellip;</button>' : '') +
+    '<button class="btn" id="dlDsoXls">Download Excel</button>' +
+    '<span class="sp"></span>' +
+    '<label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add name and time on images</label></div>';
+  html += '<div class="slots" aria-label="Zones" style="margin-bottom:14px">' + DSO_TABS.map(t => {
+    const c = computeDso(t.id), n = c ? c.sections[0].rows.length : 0, nn = c ? c.fresh.length : 0;
+    return '<button type="button" class="slot filled' + (state.dsoTab === t.id ? ' sel' : '') + '" data-dotab="' + t.id + '" tabindex="0"><span class="zn">' + esc(t.name) + '</span><span class="st">' + n + ' hub' + (n === 1 ? '' : 's') + '</span>' + (nn ? '<span class="flag">' + nn + ' new</span>' : '') + '</button>';
+  }).join('') + '</div>';
+  html += '<section class="panel" aria-label="' + esc(d.tab.name) + ' tables"><div class="phead"><h2>' + esc(d.tab.name) + '<span class="meta">Data as of ' + esc(d.stampLabel) + '</span></h2>' +
+    '<div class="pact"><button class="btn small" id="dlDsoPng">Save image</button><button class="btn small" id="cpDsoPng">Copy image</button>' + (anyShare ? '<button class="btn small" id="shDsoPng">Share&hellip;</button>' : '') + '</div></div>';
+  if (!f.dso.fromName) html += '<p class="note" style="margin:8px 16px">The file name has no download time, so the current time was used for the EDD-breach cut-off. Keep the original Metabase file name to use the real one.</p>';
+  if (d.fresh.length) {
+    html += '<div class="newstrip"><p>' + (d.fresh.length === 1 ? 'New hub in this file' : d.fresh.length + ' new hubs in this file') + ' &mdash; not seen before. Included for now. Choose whether each one stays.</p>' +
+      d.fresh.map(r => '<div class="newrow"><span class="nm">' + esc(r.name) + '</span><span class="ct">' + fmtInt(r.n) + ' orders</span><span class="ans"><button class="btn small" data-dokeep="' + esc(r.key) + '">Keep in table</button><button class="btn small" data-doout="' + esc(r.key) + '">Leave out</button></span></div>').join('') + '</div>';
+  }
+  html += d.sections[0].rows.length ? dsoTableHTML(d) : '<div class="empty"><b>No hubs in this table</b>Add some back from the list below.</div>';
+  if (d.hidden.length) {
+    html += '<div class="tray"><p>Left out of this table (' + d.hidden.length + '). Click one to add it back.</p><div class="chips">' +
+      d.hidden.map(r => '<button class="chip" data-doadd="' + esc(r.key) + '">' + esc(r.name) + '<i>' + fmtInt(r.n) + '</i></button>').join('') + '</div></div>';
+  }
+  host.innerHTML = html + '</section>';
+  $('#pubBtn').onclick = startPublish;
+  $('#dlDsoAll').onclick = () => saveDsoImages(DSO_TABS.map(t => t.id));
+  if ($('#shDsoAll')) $('#shDsoAll').onclick = () => shareDsoImages(DSO_TABS.map(t => t.id));
+  $('#dlDsoXls').onclick = downloadDsoExcel;
+  $('#dlDsoPng').onclick = () => saveDsoImages([state.dsoTab]);
+  $('#cpDsoPng').onclick = () => copyDsoImage(state.dsoTab);
+  if ($('#shDsoPng')) $('#shDsoPng').onclick = () => shareDsoImages([state.dsoTab]);
+  $('#optTitle').onchange = e => { state.showTitle = e.target.checked; };
+  host.querySelectorAll('[data-dotab]').forEach(b => b.onclick = () => { state.dsoTab = b.dataset.dotab; render(); });
+  host.querySelectorAll('[data-dorm],[data-doout]').forEach(b => b.onclick = () => dsoSetChoice(b.dataset.dorm || b.dataset.doout, 'out'));
+  host.querySelectorAll('[data-doadd],[data-dokeep]').forEach(b => b.onclick = () => dsoSetChoice(b.dataset.doadd || b.dataset.dokeep, 'in'));
+}
+
+/* ---- image ---- */
+function drawDso(d, withTitle) {
+  const S = 3, pad = 14, rowH = 24, headH = 46, barH = 26, gap = 14;
+  const mc = document.createElement('canvas').getContext('2d'); mc.font = '13px Arial, Helvetica, sans-serif';
+  let w0 = 150;
+  d.sections.forEach(s => s.rows.concat([{ name: 'Grand Total' }]).forEach(r => { w0 = Math.max(w0, Math.ceil(mc.measureText(r.name).width) + 22); }));
+  const tableW = w0 + DSO_COL_W.reduce((a, b) => a + b, 0);
+  let H = pad * 2 + (withTitle ? 30 : 0);
+  d.sections.forEach(s => { H += barH + headH + rowH * (s.rows.length + 1) + gap; });
+  H -= gap;
+  const W = tableW + pad * 2;
+  const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S;
+  const ctx = cv.getContext('2d'); ctx.scale(S, S);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); ctx.textBaseline = 'middle';
+  const box = (x, y, w, h, fill) => { if (fill) { ctx.fillStyle = fill; ctx.fillRect(x, y, w, h); } ctx.strokeStyle = '#8A9199'; ctx.lineWidth = 1; ctx.strokeRect(x + .5, y + .5, w - 1, h - 1); };
+  let y = pad;
+  if (withTitle) {
+    ctx.fillStyle = '#141D26'; ctx.font = 'bold 18px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left'; ctx.fillText('DS OFD \u2013 ' + d.tab.name, pad, y + 14);
+    ctx.fillStyle = '#5B6773'; ctx.font = '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'right'; ctx.fillText(d.stampLabel, W - pad, y + 15);
+    y += 30;
+  }
+  d.sections.forEach(s => {
+    box(pad, y, tableW, barH, '#FFFF00'); ctx.fillStyle = '#000'; ctx.font = 'bold 13px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(s.title, pad + tableW / 2, y + barH / 2 + 1); y += barH;
+    let x = pad; ctx.font = 'bold 11px Arial, Helvetica, sans-serif';
+    DSO_HEAD.forEach((hd, i) => {
+      const w = i === 0 ? w0 : DSO_COL_W[i - 1];
+      box(x, y, w, headH, '#D9E1F2'); ctx.fillStyle = '#000'; ctx.textAlign = 'center';
+      const lines = wrapLines(ctx, hd, w - 8), lh = 12, top = y + headH / 2 - (lines.length * lh) / 2 + lh / 2;
+      lines.forEach((ln, j) => ctx.fillText(ln, x + w / 2, top + j * lh)); x += w;
+    });
+    y += headH;
+    const row = (name, vals, bold, fill) => {
+      let xx = pad; ctx.font = (bold ? 'bold ' : '') + '12px Arial, Helvetica, sans-serif';
+      box(xx, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.textAlign = 'left'; ctx.fillText(name, xx + 7, y + rowH / 2 + 1); xx += w0;
+      vals.forEach((v, i) => {
+        const bg = DSO_PCTV.includes(i) ? scaleColorPerf(v, s.scales[i]) : null;
+        box(xx, y, DSO_COL_W[i], rowH, bg || fill); ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.fillText(dsoFmt(i, v), xx + DSO_COL_W[i] / 2, y + rowH / 2 + 1); xx += DSO_COL_W[i];
+      });
+      y += rowH;
+    };
+    s.rows.forEach(r => row(r.name, r.vals, false, null));
+    row('Grand Total', s.total, true, '#F2F2F2');
+    y += gap;
+  });
+  return cv;
+}
+const dsoFileName = (d, ext) => 'DS_OFD_' + d.tab.name.replace(/\s+/g, '') + '_' + dsoFile().dso.date + '_' + String(dsoFile().dso.hh).padStart(2, '0') + String(dsoFile().dso.mm).padStart(2, '0') + '.' + ext;
+function dsoBlob(tabId) {
+  const d = computeDso(tabId);
+  return new Promise((res, rej) => drawDso(d, state.showTitle).toBlob(b => b ? res({ blob: b, name: dsoFileName(d, 'png') }) : rej(new Error('Image failed')), 'image/png'));
+}
+async function saveDsoImages(ids) { try { for (const id of ids) { const r = await dsoBlob(id); saveBlob(r.blob, r.name); await new Promise(z => setTimeout(z, 250)); } toast(ids.length > 1 ? 'Saved ' + ids.length + ' images' : 'Saved image'); } catch (e) { toast(e.message, true); } }
+async function copyDsoImage(id) {
+  try {
+    if (!(navigator.clipboard && window.ClipboardItem)) throw new Error('Copy is not supported here. Use Save image instead.');
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': dsoBlob(id).then(r => r.blob) })]);
+    toast('Image copied. Paste it into WhatsApp.');
+  } catch (e) { toast(e.message && /supported/.test(e.message) ? e.message : 'Could not copy. Use Save image instead.', true); }
+}
+async function shareDsoImages(ids) {
+  try {
+    const files = []; for (const id of ids) { const r = await dsoBlob(id); files.push(new File([r.blob], r.name, { type: 'image/png' })); }
+    await navigator.share({ files, title: 'DS OFD ' + dsoStampLabel(dsoFile().dso) });
+  } catch (e) { if (e.name !== 'AbortError') toast('Sharing was not possible. Use Save image instead.', true); }
+}
+
+/* ---- Excel: one sheet per tab, laid out like the current script's output ---- */
+async function downloadDsoExcel() {
+  const f = dsoFile(); if (!f) return;
+  try {
+    const wb = new ExcelJS.Workbook(); wb.created = new Date();
+    const thin = { style: 'thin' }, border = { top: thin, left: thin, bottom: thin, right: thin };
+    const fill = argb => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+    DSO_TABS.forEach(tab => {
+      const d = computeDso(tab.id);
+      if (!d || !d.sections[0].rows.length) return;
+      const ws = wb.addWorksheet(tab.name);
+      const widths = DSO_HEAD.map((h, i) => Math.max(...h.split(/\s+/).map(w => w.length)));
+      let r = 1;
+      d.sections.forEach(s => {
+        ws.mergeCells(r, 1, r, DSO_HEAD.length);
+        const t = ws.getCell(r, 1); t.value = s.title; t.font = { bold: true }; t.fill = fill('FFFFFF00'); t.alignment = { horizontal: 'center', vertical: 'middle' };
+        r++;
+        ws.getRow(r).height = 29;
+        DSO_HEAD.forEach((h, j) => { const c = ws.getCell(r, j + 1); c.value = h; c.font = { bold: true }; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; c.border = border; });
+        const hr = r; r++;
+        const put = (name, vals, bold) => {
+          const nc = ws.getCell(r, 1); nc.value = name; nc.alignment = { horizontal: 'center', vertical: 'middle' }; nc.border = border; if (bold) nc.font = { bold: true };
+          widths[0] = Math.max(widths[0], name.length);
+          vals.forEach((v, i) => {
+            const c = ws.getCell(r, i + 2); c.value = v; c.alignment = { horizontal: 'center', vertical: 'middle' }; c.border = border;
+            if (DSO_PCTV.includes(i)) c.numFmt = '0%'; if (bold) c.font = { bold: true };
+            widths[i + 1] = Math.max(widths[i + 1], (DSO_PCTV.includes(i) ? fmtPct(v) : String(v)).length);
+          });
+          r++;
+        };
+        s.rows.forEach(x => put(x.name, x.vals, false));
+        put('Grand Total', s.total, true);
+        DSO_PCTV.forEach(i => { const L = openpyxlCol(i + 2); ws.addConditionalFormatting({ ref: L + (hr + 1) + ':' + L + (r - 1), rules: [{ type: 'colorScale', priority: 1, cfvo: [{ type: 'min' }, { type: 'percentile', value: 50 }, { type: 'max' }], color: [{ argb: 'FFF8696B' }, { argb: 'FFFFEB84' }, { argb: 'FF63BE7B' }] }] }); });
+        r++;
+      });
+      widths.forEach((w, i) => { ws.getColumn(i + 1).width = Math.max(w + 2, 6); });
+    });
+    if (!wb.worksheets.length) { toast('Nothing to download yet.', true); return; }
+    const o = f.dso, name = 'DS_OFD_' + o.date + '_' + String(o.hh).padStart(2, '0') + String(o.mm).padStart(2, '0') + '.xlsx';
+    saveBlob(new Blob([await wb.xlsx.writeBuffer()], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), name);
+    toast('Saved ' + name);
+  } catch (e) { console.error(e); toast('Excel could not be created: ' + e.message, true); }
+}
+
+/* ==========================================================================
    TOP-LEVEL RENDER
    ========================================================================== */
 function render() {
@@ -2461,13 +2781,13 @@ function render() {
   if (state.report === 'ofd') { renderSlots(); renderHint(); renderFix(); renderOfd(); }
   else {
     $('#slots').innerHTML = ''; $('#hint').innerHTML = ''; $('#fix').innerHTML = '';
-    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : renderDs();
+    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : state.report === 'dso' ? renderDso() : renderDs();
   }
   const rs = $('#foot-reset');
-  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : 'DS Performance';
+  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : 'DS Performance';
   rs.innerHTML = '<button class="link" id="pubSettings">Publish settings</button> &nbsp; <button class="link" id="resetChoices">Forget saved ' + which + ' choices</button>' +
     (storageOK ? '' : ' <span>(this browser is not allowing saved settings)</span>');
-  $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : resetDsHistory(); };
+  $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : resetDsHistory(); };
   $('#pubSettings').onclick = () => showPubSetup();
 }
 
@@ -2552,7 +2872,9 @@ function buildReportHTML() {
   const haveCod = COD_REGIONS.some(r => { const c = computeCod(r); return c && c.sections.length; });
   const dsDates = dsHasHistory() ? dsLastDays(DS_WINDOW) : [];
   const haveDs = dsDates.length > 0;
-  if (!haveOfd && !havePerf && !haveCod && !haveDs) return null;
+  const dsoTabs = dsoFile() ? DSO_TABS.map(tb => ({ id: tb.id, d: computeDso(tb.id) })).filter(x => x.d && x.d.sections[0].rows.length) : [];
+  const haveDso = dsoTabs.length > 0;
+  if (!haveOfd && !havePerf && !haveCod && !haveDs && !haveDso) return null;
 
   const css = ':root{--ink:#141D26;--muted:#5B6773;--rule:#CBD3DB;--accent:#1F4E9E;--hdr:#D9E1F2;--ground:#E9EDF1}' +
     '*{box-sizing:border-box}body{margin:0;background:var(--ground);color:var(--ink);font:15px/1.45 "Bahnschrift","DIN Alternate","Avenir Next","Segoe UI",system-ui,-apple-system,Roboto,sans-serif}' +
@@ -2589,17 +2911,19 @@ function buildReportHTML() {
     ofd: ofdData ? ofdData.map(x => ({ zone: x.zone, file: ofdImgName(x.zone), shown: x.d.shown.map(r => ({ cells: r.cells })), total: { cells: x.d.total.cells, fb: x.d.total.fb }, scales: x.d.scales })) : null,
     perf: perfData ? perfData.map(x => ({ view: x.view, dates: x.dates.map(dt => ({ date: dt, file: perfImgName(x.view, dt), day: perfDay(x.view, dt) })) })) : null,
     cod: codData ? codData.map(x => ({ region: x.region, file: codImgName(x.region), d: x.d })) : null,
-    ds: dsData ? { dates: dsDates, file: dsImgName(), zones: dsData } : null
+    ds: dsData ? { dates: dsDates, file: dsImgName(), zones: dsData } : null,
+    dso: haveDso ? dsoTabs.map(x => ({ file: dsoFileName(x.d, 'png'), d: x.d })) : null
   };
 
   const drawSrc = 'const HEADERS=' + JSON.stringify(HEADERS) + ',COL_W=' + JSON.stringify(COL_W) + ',PCT_COLS=' + JSON.stringify(PCT_COLS) +
     ',PERF_LABELS=' + JSON.stringify(PERF_LABELS) + ',PERF_PCT=' + JSON.stringify(PERF_PCT) + ',PERF_COL_W=' + JSON.stringify(PERF_COL_W) +
     ',RED=' + JSON.stringify(RED) + ',YEL=' + JSON.stringify(YEL) + ',GRN=' + JSON.stringify(GRN) +
     ',COD_LABELS=' + JSON.stringify(COD_LABELS) + ',COD_GROUPS=' + JSON.stringify(COD_GROUPS) + ',COD_COL_W=' + JSON.stringify(COD_COL_W) +
-    ',DS_LABELS=' + JSON.stringify(DS_LABELS) + ',DS_PCT=' + JSON.stringify(DS_PCT) + ';' +
+    ',DS_LABELS=' + JSON.stringify(DS_LABELS) + ',DS_PCT=' + JSON.stringify(DS_PCT) +
+    ',DSO_HEAD=' + JSON.stringify(DSO_HEAD) + ',DSO_PCTV=' + JSON.stringify(DSO_PCTV) + ',DSO_COL_W=' + JSON.stringify(DSO_COL_W) + ';' +
     'const MON=' + JSON.stringify(MON) + ';const fmtInt=' + fmtInt + ';const fmtPct=' + fmtPct + ';const fmtDateLong=' + fmtDateLong + ';' +
     'var DATA=' + jsonForScript(runtimeData) + ';const stampText=function(){return DATA.stamp};\n' +
-    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll].join('\n');
+    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso].join('\n');
 
   const uiSrc = '(function(){' +
     'var rt=[].slice.call(document.querySelectorAll("[data-rtab]")),rs=[].slice.call(document.querySelectorAll(".rsec"));' +
@@ -2617,6 +2941,8 @@ function buildReportHTML() {
     '[].slice.call(document.querySelectorAll("[data-cimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.cimg;codBlobAt(i).then(function(bl){saveAs(bl,DATA.cod[i].file)})}});' +
     'function dsBlob(){var cv=drawDsAll(DATA.ds.dates,DATA.showTitle,DATA.ds.zones.map(function(z){return {zone:z.zone,day:z.days}}));return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-dsimg]")).forEach(function(b){b.onclick=function(){dsBlob().then(function(bl){saveAs(bl,DATA.ds.file)})}});' +
+    'function dsoBlobAt(i){var c=DATA.dso[i];var cv=drawDso(c.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
+    '[].slice.call(document.querySelectorAll("[data-dimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.dimg;dsoBlobAt(i).then(function(bl){saveAs(bl,DATA.dso[i].file)})}});' +
     '})();';
 
   let body = '<div class="wrap"><h1>Daily reports</h1><p class="up">Updated ' + esc(stampText()) + '</p>';
@@ -2625,6 +2951,7 @@ function buildReportHTML() {
   if (havePerf) rtabs.push(['perf', 'Daily performance']);
   if (haveCod) rtabs.push(['cod', 'COD Pendency']);
   if (haveDs) rtabs.push(['ds', 'DS Performance']);
+  if (haveDso) rtabs.push(['dso', 'DS OFD']);
   if (rtabs.length > 1) body += '<div class="tabs" role="group" aria-label="Report">' + rtabs.map(([id, n]) => '<button type="button" data-rtab="' + id + '" aria-pressed="false">' + esc(n) + '</button>').join('') + '</div>';
 
   if (haveOfd) {
@@ -2666,6 +2993,15 @@ function buildReportHTML() {
     body += '<div class="rsec" id="r-ds"' + (rtabs.length > 1 ? ' hidden' : '') + '>';
     body += '<div class="ph"><h2>DS Performance</h2><button type="button" data-dsimg>Save as image</button></div>';
     body += dsData.map(x => '<section class="panel"><div class="ph"><h2 style="width:100%;text-align:center">' + esc(x.zone) + '</h2></div>' + dsMultiTable(x.zone, dsDates, { static: true, days: x.days }) + '</section>').join('');
+    body += '</div>';
+  }
+  if (haveDso) {
+    body += '<div class="rsec" id="r-dso"' + (rtabs.length > 1 ? ' hidden' : '') + '>';
+    body += '<div class="tabs" role="group" aria-label="Zones">' + dsoTabs.map((x, i) => '<button type="button" data-tab="do' + i + '" aria-pressed="false">' + esc(x.d.tab.name) + '</button>').join('') + '</div>';
+    dsoTabs.forEach((x, i) => {
+      body += '<section data-sec="do' + i + '" class="panel" hidden><div class="ph"><h2>' + esc(x.d.tab.name) + '<span class="meta">Data as of ' + esc(x.d.stampLabel) + '</span></h2><button type="button" data-dimg="' + i + '">Save as image</button></div>' +
+        dsoTableHTML(x.d, { static: true }) + '</section>';
+    });
     body += '</div>';
   }
   body += '</div>';
@@ -2828,6 +3164,7 @@ loadChoices();
 loadPerf();
 loadCod();
 loadDs();
+loadDso();
 loadPub();
 render();
 </script>
