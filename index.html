@@ -1676,7 +1676,7 @@ function renderPerf() {
 /* ==========================================================================
    PERFORMANCE IMAGE
    ========================================================================== */
-const PERF_COL_W = [62, 56, 58, 60, 62, 58, 64];
+const PERF_COL_W = [66, 60, 62, 64, 66, 62, 66];
 function drawPerfDay(day, withTitle) {
   const S = 3, pad = 14, rowH = 26, headH = 40, titleH = withTitle ? 38 : 0;
   const cols = day.sunday ? PERF_LABELS : PERF_LABELS.filter((_, i) => i !== 5);
@@ -1768,7 +1768,7 @@ function drawPerfMultiDay(view, dates, withTitle) {
   const idxs = days.map(d => d.sunday ? [0, 1, 2, 3, 4, 5, 6] : [0, 1, 2, 3, 4, 6]);
   const scales = days.map(perfScales);
 
-  const S = 3, pad = 14, rowH = 25, headH1 = 24, headH2 = 34, titleH = withTitle ? 36 : 0;
+  const S = 3, pad = 14, rowH = 30, headH1 = 26, headH2 = 38, titleH = withTitle ? 36 : 0;
   const mc = document.createElement('canvas').getContext('2d'); mc.font = '13px Arial, Helvetica, sans-serif';
   let w0 = 168;
   canon.forEach(g => { w0 = Math.max(w0, Math.ceil(mc.measureText(g.mgr).width) + 20); g.hubs.forEach(h => { w0 = Math.max(w0, Math.ceil(mc.measureText('  ' + h.name).width) + 24); }); });
@@ -1804,7 +1804,7 @@ function drawPerfMultiDay(view, dates, withTitle) {
     idxs[di].forEach((i, k) => {
       cellBox(x, y, dateColW[di][k], headH2, '#D9E1F2'); ctx.fillStyle = '#000';
       const lines = wrapLines(ctx, PERF_LABELS[i], dateColW[di][k] - 6);
-      const lh = 12, top = y + headH2 / 2 - (lines.length * lh) / 2 + lh / 2;
+      const lh = 13, top = y + headH2 / 2 - (lines.length * lh) / 2 + lh / 2;
       lines.forEach((ln, j) => ctx.fillText(ln, x + dateColW[di][k] / 2, top + j * lh));
       x += dateColW[di][k];
     });
@@ -1813,7 +1813,7 @@ function drawPerfMultiDay(view, dates, withTitle) {
 
   const drawRow = (name, indent, getCells, bold, fill) => {
     let xx = pad;
-    cellBox(xx, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.font = (bold ? 'bold ' : '') + '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left';
+    cellBox(xx, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.font = (bold ? 'bold ' : '') + '14px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left';
     ctx.fillText((indent ? '  ' : '') + name, xx + 7, y + rowH / 2 + 1); xx += w0;
     days.forEach((d, di) => {
       const cells = getCells(di);
@@ -1821,7 +1821,7 @@ function drawPerfMultiDay(view, dates, withTitle) {
         const v = (cells || [])[i];
         const bg = fill || scaleColorPerf(v, scales[di] && scales[di][i]);
         cellBox(xx, y, dateColW[di][k], rowH, bg);
-        ctx.fillStyle = '#000'; ctx.font = (bold ? 'bold ' : '') + '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+        ctx.fillStyle = '#000'; ctx.font = 'bold 15px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';   // values always bold, for legibility
         ctx.fillText(v == null ? '\u2013' : perfFmtCell(i, v).replace('&ndash;', '\u2013'), xx + dateColW[di][k] / 2, y + rowH / 2 + 1);
         xx += dateColW[di][k];
       });
@@ -2884,7 +2884,7 @@ async function downloadDsoExcel() {
    current dashboard Excel once loads the earlier days. Hubs can be left out or added back.
    ========================================================================== */
 const FE_KEY = 'fe-history-v1', FE_CH_KEY = 'fe-choices-v1';
-const FE_W1 = 5, FE_W2 = 4, FE_KEEP_DAYS = 45;
+const FE_W1 = 5, FE_W2 = 4, FE_KEEP_DAYS = FE_W1;  // storage keeps exactly the window shown on screen; older days are deleted, not hidden
 const FE_TABS = [{ id: 'trips', name: 'Trips & Same Route', short: 'Trips' }, { id: 'tat', name: 'Out of TAT', short: 'OutTAT' }];
 const FE_SEED = ['Central Hub - 908', 'Chhatarpur - 958', 'East Delhi - 931', 'Faridabad-948', 'Ghaziabad-952', 'HUMANYUPUR HUB-945',
   'Nangloi Hub - 935', 'Noida Hub - 907', 'Okhla Hub-939', 'Sarhaul GGN Hub-947', 'Transport Nagar - 934', 'West Hub - 906'];
@@ -3044,8 +3044,8 @@ function renderFe() {
 
 /* ---- image ---- */
 function drawFe(d, withTitle) {
-  const S = 3, pad = 14, rowH = 24, hasG = !!d.groupHead, gH = hasG ? 24 : 0, cH = hasG ? 26 : 44, headTot = gH + cH;
-  const colW = hasG ? 86 : 94, ncols = d.cols.length;
+  const S = 3, pad = 14, rowH = 30, hasG = !!d.groupHead, gH = hasG ? 26 : 0, cH = hasG ? 28 : 46, headTot = gH + cH;
+  const colW = hasG ? 92 : 100, ncols = d.cols.length;
   const mc = document.createElement('canvas').getContext('2d'); mc.font = 'bold 12px Arial, Helvetica, sans-serif';
   let w0 = 110; d.rows.concat([{ name: d.totalLabel }]).forEach(r => { w0 = Math.max(w0, Math.ceil(mc.measureText(r.name).width) + 24); });
   const tableW = w0 + colW * ncols, W = tableW + pad * 2, H = pad * 2 + (withTitle ? 30 : 0) + headTot + rowH * (d.rows.length + 1);
@@ -3073,9 +3073,14 @@ function drawFe(d, withTitle) {
   });
   y += headTot;
   const row = (name, cells, bold, fill) => {
-    ctx.font = (bold ? 'bold ' : '') + '12px Arial, Helvetica, sans-serif';
+    ctx.font = (bold ? 'bold ' : '') + '14px Arial, Helvetica, sans-serif';
     box(pad, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.fillText(name, pad + w0 / 2, y + rowH / 2 + 1);
-    cells.forEach((c, i) => { const x = pad + w0 + colW * i; box(x, y, colW, rowH, c.bg || fill); ctx.fillStyle = '#000'; ctx.fillText(c.t, x + colW / 2, y + rowH / 2 + 1); });
+    cells.forEach((c, i) => {
+      const x = pad + w0 + colW * i;
+      box(x, y, colW, rowH, c.bg || fill); ctx.fillStyle = '#000';
+      ctx.font = (bold || c.c) ? 'bold 15px Arial, Helvetica, sans-serif' : '14px Arial, Helvetica, sans-serif';   // percentage cells stand out
+      ctx.fillText(c.t, x + colW / 2, y + rowH / 2 + 1);
+    });
     y += rowH;
   };
   d.rows.forEach(r => row(r.name, r.cells, false, null));
