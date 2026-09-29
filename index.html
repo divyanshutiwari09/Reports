@@ -258,7 +258,8 @@ const REPORTS = [
   { id: 'perf', name: 'Daily performance' },
   { id: 'cod',  name: 'COD Pendency' },
   { id: 'ds',   name: 'DS Performance' },
-  { id: 'dso',  name: 'DS OFD' }
+  { id: 'dso',  name: 'DS OFD' },
+  { id: 'fe',   name: 'FE Dashboard' }
 ];
 
 /* ---- OFD report ---- */
@@ -307,6 +308,7 @@ const DS_LABELS = ['TOTAL COUNT', 'IN TAT SLA', 'SAME DAY SLA', 'FASR', 'DEL+VC'
 const DS_PCT = [1, 2, 3, 4];
 const DS_COL_W = [72, 68, 78, 60, 64];
 const DSO_EXTRA = ['STATUS', 'PACKED', 'OFD', 'ATTEMPT COMPLIANCE', 'EDD TIME'];
+const FE_REQUIRED = ['DATE', 'DELIVERY CENTRE', 'PAYOUT TYPE', 'ALLOCATED ROUTE', 'ACTUAL ROUTE', 'TOTAL DELIVERY', 'OUT OF TAT DELIVERY'];
 const DS_WINDOW = 2;     // days shown on screen, in the image and on the shared page
 const DS_CLEAN_DAY = 4;  // last month is cleared once the report date reaches this day
 const COD_BUCKET_KEYS = ['1', '2', '3', '4-5', '6-30', '>30'];
@@ -338,6 +340,7 @@ const state = {
   pview: 'DELHI NDD', // performance view on screen
   cregion: 'DELHI',   // COD Pendency region on screen
   dsoTab: 'delhi',    // DS OFD tab on screen
+  feTab: 'trips',     // FE Dashboard tab on screen
   showTitle: true,
   showFix: false,
   batch: 0,
@@ -763,8 +766,99 @@ function parseDsOfdRows(rows, head, st) {
   return { date: st.iso, hh: st.hh, mm: st.mm, fromName: st.fromName, hubs, rows: total, skipped };
 }
 
+/* ---- FE Dashboard (FE reach report): raw file = one row per trip; only the latest date in a raw file is used ---- */
+function feSame(alloc, actual) {
+  // same as the manual formula: the number in ALLOCATED ROUTE must appear in the comma list of ACTUAL ROUTE
+  if (!alloc || !actual) return false;
+  const a = String(alloc).trim(), b = String(actual).trim();
+  const num = a.indexOf('Route ') === 0 ? a.slice(6).trim() : a;
+  return b.split('Route ').join('').split(' ').join('').split(',').indexOf(num) >= 0;
+}
+function parseFeRows(rows, head) {
+  const col = n => head.indexOf(n.toLowerCase());
+  const C = { date: col('DATE'), hub: col('DELIVERY CENTRE'), pay: col('PAYOUT TYPE'), alloc: col('ALLOCATED ROUTE'), actual: col('ACTUAL ROUTE'), total: col('TOTAL DELIVERY'), out: col('OUT OF TAT DELIVERY') };
+  const S = v => (v == null ? '' : String(v).trim());
+  let latest = null; const seen = {};
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    const d = codParseDate(row[C.date]);
+    if (d != null) { seen[d] = true; if (latest == null || d > latest) latest = d; }
+  }
+  const hubs = new Map(); let n = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    if (latest == null || codParseDate(row[C.date]) !== latest) continue;
+    const name = S(row[C.hub]); if (!name) continue;
+    const key = bkey(name);
+    let h = hubs.get(key);
+    if (!h) { h = { name, trips: 0, same: 0, total: 0, outTat: 0 }; hubs.set(key, h); }
+    n++; h.trips++;
+    if (feSame(S(row[C.alloc]), S(row[C.actual]))) h.same++;
+    if (S(row[C.pay]) === '2 HOURS(TRIP)') { h.total += Number(row[C.total]) || 0; h.outTat += Number(row[C.out]) || 0; }   // delivery counts: this payout type only
+  }
+  if (latest == null) throw new Error('No dates found in the DATE column.');
+  return { kind: 'fe', date: dsDateSlug(latest), dates: Object.keys(seen).map(Number).sort((a, b) => a - b).map(dsDateSlug), hubs, trips: n, rows: n };
+}
+function parseFeDash(buf) {
+  // an existing dashboard Excel (Sheet1 = trips and % same route, Sheet2 = total / out of TAT): loads its past days
+  const wb = XLSX.read(buf, { type: 'array', dense: true, cellDates: true, cellStyles: false, cellNF: false, cellText: false, cellHTML: false });
+  const w1 = wb.Sheets['Sheet1']; if (!w1) throw new Error('Sheet1 was not found in this dashboard file.');
+  const r1 = XLSX.utils.sheet_to_json(w1, { header: 1, raw: true, defval: null });
+  const top = r1[0] || [];
+  let pctStart = -1; top.forEach((v, i) => { if (pctStart < 0 && i > 1 && String(v == null ? '' : v).trim().charAt(0) === '%') pctStart = i; });
+  if (pctStart < 0) throw new Error('Could not find the % Same Route block in Sheet1.');
+  const n = pctStart - 1, dates1 = [];
+  for (let i = 0; i < n; i++) dates1.push(codParseDate(r1[1] && r1[1][1 + i]));
+  const days = {}, dayOf = ms => { const iso = dsDateSlug(ms); return days[iso] || (days[iso] = { hubs: {}, hasTotals: false }); };
+  let count = 0;
+  for (let r = 2; r < r1.length; r++) {
+    const row = r1[r]; if (!row) continue;
+    const name = row[0] == null ? '' : String(row[0]).trim(); if (!name) continue;
+    if (name.toLowerCase() === 'overall') break;
+    const key = bkey(name); count++;
+    for (let i = 0; i < n; i++) {
+      if (dates1[i] == null) continue;
+      const trips = Number(row[1 + i]) || 0, pct = Number(row[pctStart + i]) || 0;
+      dayOf(dates1[i]).hubs[key] = { name, trips, same: Math.round(pct * trips), total: null, outTat: null };
+    }
+  }
+  const valid = dates1.filter(x => x != null);
+  if (!valid.length) throw new Error('No dates found in Sheet1.');
+  const w2 = wb.Sheets['Sheet2'];
+  if (w2) {
+    const r2 = XLSX.utils.sheet_to_json(w2, { header: 1, raw: true, defval: null });
+    const MO = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'], latestMs = Math.max.apply(null, valid), tc = [];
+    (r2[0] || []).forEach((h, c) => {
+      const m = /^(\d+)-([A-Za-z]+)\s+Total$/i.exec(String(h == null ? '' : h).trim()); if (!m) return;
+      const mi = MO.indexOf(m[2].slice(0, 3).toLowerCase()); if (mi < 0) return;
+      let ms = Date.UTC(new Date(latestMs).getUTCFullYear(), mi, +m[1]);
+      if (ms > latestMs + 86400000) ms = Date.UTC(new Date(latestMs).getUTCFullYear() - 1, mi, +m[1]);
+      tc.push({ ms, c });
+    });
+    for (let r = 1; r < r2.length; r++) {
+      const row = r2[r]; if (!row) continue;
+      const name = row[0] == null ? '' : String(row[0]).trim(); if (!name) continue;
+      if (name.toLowerCase() === 'grand total') break;
+      const key = bkey(name);
+      tc.forEach(x => {
+        const day = dayOf(x.ms); day.hasTotals = true;
+        const h = day.hubs[key] || (day.hubs[key] = { name, trips: 0, same: 0, total: null, outTat: null });
+        h.total = Number(row[x.c]) || 0; h.outTat = Number(row[x.c + 1]) || 0;
+      });
+    }
+  }
+  return { kind: 'fedash', days, rows: count };
+}
+
 function parseAny(buf, name) {
   const names = XLSX.read(buf, { type: 'array', bookSheets: true }).SheetNames;
+  if (names.indexOf('Sheet1') >= 0 && names.indexOf('Sheet2') >= 0) {
+    const wbTest = XLSX.read(buf, { type: 'array', dense: true, cellDates: true, sheets: 'Sheet1', cellStyles: false, cellNF: false, cellText: false, cellHTML: false });
+    const r1 = wbTest.Sheets['Sheet1'] ? XLSX.utils.sheet_to_json(wbTest.Sheets['Sheet1'], { header: 1, raw: true, defval: null }) : null;
+    const a2 = r1 && r1[1] && r1[1][0] != null ? String(r1[1][0]).trim().toLowerCase() : '';
+    if (a2 === 'hub') return parseFeDash(buf);
+  }
+
   const pick = names.indexOf('Detail') >= 0 ? 'Detail' : (names.indexOf('Sheet1') >= 0 ? 'Sheet1' : names[0]);
   if (!pick) throw new Error('No sheet found in this file.');
   const wb = XLSX.read(buf, { type: 'array', dense: true, cellDates: true, sheets: pick, cellStyles: false, cellNF: false, cellText: false, cellHTML: false });
@@ -774,7 +868,7 @@ function parseAny(buf, name) {
   if (!rows.length) throw new Error('The sheet is empty.');
   const head = rows[0].map(h => String(h == null ? '' : h).trim().toLowerCase());
   const missing = list => list.filter(c => head.indexOf(c.toLowerCase()) < 0);
-  const mc = missing(COD_NEEDED), mp = missing(PERF_REQUIRED), mo = missing(OFD_REQUIRED), md = missing(DS_REQUIRED);
+  const mc = missing(COD_NEEDED), mp = missing(PERF_REQUIRED), mo = missing(OFD_REQUIRED), md = missing(DS_REQUIRED), mf = missing(FE_REQUIRED);
   if (!mc.length) return parseCodRows(rows, head);
   if (!mp.length) return parsePerfRows(rows, head);
   if (!mo.length) return parseOfdRows(rows, head);
@@ -783,8 +877,9 @@ function parseAny(buf, name) {
     if (!missing(DSO_EXTRA).length) r.ofd = parseDsOfdRows(rows, head, dsoStamp(name));
     return r;
   }
-  const opts = [{ n: 'COD Pendency', m: mc }, { n: 'Daily performance', m: mp }, { n: 'OFD', m: mo }, { n: 'DS Performance', m: md }].sort((a, b) => a.m.length - b.m.length);
-  throw new Error('Not recognised as an OFD, Daily performance, COD Pendency or DS Performance file. Closest match is ' + opts[0].n + ', missing: ' + opts[0].m.join(', '));
+  if (!mf.length) return parseFeRows(rows, head);
+  const opts = [{ n: 'COD Pendency', m: mc }, { n: 'Daily performance', m: mp }, { n: 'OFD', m: mo }, { n: 'DS Performance', m: md }, { n: 'FE Dashboard', m: mf }].sort((a, b) => a.m.length - b.m.length);
+  throw new Error('Not recognised as an OFD, Daily performance, COD Pendency, DS Performance or FE Dashboard file. Closest match is ' + opts[0].n + ', missing: ' + opts[0].m.join(', '));
 }
 
 /* ---- background workers ---- */
@@ -795,10 +890,10 @@ function getWorkerURL() {
   const lib = document.getElementById('xlsx-src').textContent;
   const code = lib + '\n;const OFD_REQUIRED=' + JSON.stringify(OFD_REQUIRED) + ',PERF_REQUIRED=' + JSON.stringify(PERF_REQUIRED) +
     ',PERF_DROP=' + JSON.stringify(PERF_DROP) + ',COD_REQUIRED=' + JSON.stringify(COD_REQUIRED) + ',COD_NEEDED=' + JSON.stringify(COD_NEEDED) +
-    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) +
+    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) +
     ';const bkey=' + bkey + ';const isY=' + isY + ';\n' +
     parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
-    dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
+    dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + feSame + '\n' + parseFeRows + '\n' + parseFeDash + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
     'self.onmessage=function(e){try{self.postMessage({ok:true,p:parseAny(e.data.buf,e.data.name)});}catch(err){self.postMessage({ok:false,msg:String((err&&err.message)||err)});}};';
   workerURL = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   return workerURL;
@@ -882,6 +977,15 @@ async function processOne(f, rec) {
         toast(f.name + ': orders are for ' + fmtDateLong(p.date) + ' (a finished day), so it went to DS Performance only.');
         if (!state.picked) state.report = 'ds';
       }
+    } else if (p.kind === 'fe') {
+      rec.rows = p.rows; applyFeRaw(p);
+      toast(f.name + ': added ' + fmtDateLong(p.date) + ' to FE Dashboard history.');
+      if (!state.picked) state.report = 'fe';
+    } else if (p.kind === 'fedash') {
+      rec.rows = p.rows; applyFeDash(p);
+      toast(f.name + ': loaded ' + Object.keys(p.days).length + ' earlier day(s) into FE Dashboard.');
+      if (!state.picked) state.report = 'fe';
+
     } else {
       rec.branches = p.branches; rec.rows = p.rows; rec.unassigned = p.unassigned;
       const z = detectZone(p.branches);
@@ -927,7 +1031,7 @@ async function addFiles(fileList) {
   render();
 }
 
-const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : false;
+const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : id === 'fe' ? feHasHistory() : false;
 
 
 /* ==========================================================================
@@ -2774,6 +2878,280 @@ async function downloadDsoExcel() {
 }
 
 /* ==========================================================================
+   FE DASHBOARD  (FE reach report)
+   Each raw file adds its latest date to a history kept in this browser. Sheet 1 shows the last 5
+   dates (trips and % same route), Sheet 2 the last 4 (delivery totals and out-of-TAT). Dropping your
+   current dashboard Excel once loads the earlier days. Hubs can be left out or added back.
+   ========================================================================== */
+const FE_KEY = 'fe-history-v1', FE_CH_KEY = 'fe-choices-v1';
+const FE_W1 = 5, FE_W2 = 4, FE_KEEP_DAYS = 45;
+const FE_TABS = [{ id: 'trips', name: 'Trips & Same Route', short: 'Trips' }, { id: 'tat', name: 'Out of TAT', short: 'OutTAT' }];
+const FE_SEED = ['Central Hub - 908', 'Chhatarpur - 958', 'East Delhi - 931', 'Faridabad-948', 'Ghaziabad-952', 'HUMANYUPUR HUB-945',
+  'Nangloi Hub - 935', 'Noida Hub - 907', 'Okhla Hub-939', 'Sarhaul GGN Hub-947', 'Transport Nagar - 934', 'West Hub - 906'];
+const FE_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+let feHistory = { days: {}, names: {} };   // days: iso -> { hubs: { key: {trips, same, total, outTat} }, hasTotals }
+let feChoices = {};                         // hubKey -> 'in' | 'out'
+
+function loadFe() {
+  feHistory = { days: {}, names: {} }; feChoices = {};
+  try { const s = JSON.parse(lsGet(nsKey(FE_KEY)) || 'null'); if (s && s.days) feHistory = { days: s.days, names: s.names || {} }; } catch (e) {}
+  try { const c = JSON.parse(lsGet(nsKey(FE_CH_KEY)) || 'null'); if (c) feChoices = c; } catch (e) {}
+}
+function saveFe() {
+  const keys = Object.keys(feHistory.days).sort();
+  keys.slice(0, Math.max(0, keys.length - FE_KEEP_DAYS)).forEach(k => { delete feHistory.days[k]; });
+  lsSet(nsKey(FE_KEY), JSON.stringify(feHistory));
+}
+function saveFeChoices() { lsSet(nsKey(FE_CH_KEY), JSON.stringify(feChoices)); }
+function resetFeChoices() { lsDel(nsKey(FE_CH_KEY)); feChoices = {}; render(); toast('Saved FE hub choices cleared'); }
+function clearFeDays() {
+  if (!window.confirm('Remove all saved FE Dashboard days from this browser? You can bring them back by dropping your dashboard Excel.')) return;
+  lsDel(nsKey(FE_KEY)); feHistory = { days: {}, names: {} }; render(); toast('Saved FE days cleared');
+}
+function feSetChoice(key, val) { feChoices[key] = val; saveFeChoices(); render(); }
+const feHasHistory = () => Object.keys(feHistory.days).length > 0;
+const feLastDays = n => Object.keys(feHistory.days).sort().slice(-n);
+function applyFeRaw(p) {
+  const hubs = {};
+  p.hubs.forEach((h, key) => { hubs[key] = { trips: h.trips, same: h.same, total: h.total, outTat: h.outTat }; feHistory.names[key] = h.name; });
+  feHistory.days[p.date] = { hubs, hasTotals: true };      // same date again = overwritten, like the script
+  saveFe();
+}
+function applyFeDash(p) {
+  Object.keys(p.days).forEach(iso => {
+    const src = p.days[iso], hubs = {};
+    Object.keys(src.hubs).forEach(k => { const h = src.hubs[k]; hubs[k] = { trips: h.trips, same: h.same, total: h.total, outTat: h.outTat }; feHistory.names[k] = h.name; });
+    feHistory.days[iso] = { hubs, hasTotals: src.hasTotals };
+  });
+  saveFe();
+}
+
+function feFmt(k, v) { return v == null ? '\u2013' : k === 'pct2' ? (v * 100).toFixed(2) + '%' : k === 'pct0' ? fmtPct(v) : fmtInt(v); }
+function feScale(vals, rev) {
+  const v = vals.filter(x => x != null).map(x => rev ? -x : x).sort((a, b) => a - b);
+  if (v.length < 2) return null;
+  const pos = (v.length - 1) * 0.5, lo = Math.floor(pos), hi = Math.ceil(pos);
+  return { min: v[0], mid: v[lo] + (v[hi] - v[lo]) * (pos - lo), max: v[v.length - 1] };
+}
+function computeFe(tabId) {
+  if (!feHasHistory()) return null;
+  const tat = tabId === 'tat', tab = FE_TABS[tat ? 1 : 0];
+  const dates = feLastDays(tat ? FE_W2 : FE_W1), n = dates.length, day = d => feHistory.days[d];
+  const keys = new Set(); dates.forEach(d => Object.keys(day(d).hubs).forEach(k => keys.add(k)));
+  const ros = new Set(FE_SEED.map(bkey)), shown = [], hidden = [], fresh = [];
+  keys.forEach(k => {
+    const it = { key: k, name: feHistory.names[k] || k }, ch = feChoices[k];
+    if (ch === 'out') hidden.push(it); else { shown.push(it); if (!ch && !ros.has(k)) fresh.push(it); }
+  });
+  const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true });
+  shown.sort(byName); hidden.sort(byName); fresh.sort(byName);
+  const raw = (k, d) => {
+    const h = day(d).hubs[k] || {}, t = day(d).hasTotals;
+    return { trips: h.trips || 0, same: h.same || 0, total: t ? (h.total || 0) : null, out: t ? (h.outTat || 0) : null };
+  };
+  const cellsFor = r => {
+    if (!tat) return r.map(x => ({ v: x.trips, k: 'int' })).concat(r.map(x => ({ v: x.trips ? x.same / x.trips : 0, k: 'pct2', c: true })));
+    const cells = [];
+    r.forEach(x => { cells.push({ v: x.total, k: 'int' }); cells.push({ v: x.out, k: 'int' }); });
+    return cells.concat(r.map(x => ({ v: x.total == null ? null : (x.total ? x.out / x.total : 0), k: 'pct0', c: true })));
+  };
+  const rows = shown.map(s => ({ key: s.key, name: s.name, cells: cellsFor(dates.map(d => raw(s.key, d))) }));
+  const sums = dates.map(d => {
+    const t = { trips: 0, same: 0, total: day(d).hasTotals ? 0 : null, out: day(d).hasTotals ? 0 : null };
+    shown.forEach(s => { const x = raw(s.key, d); t.trips += x.trips; t.same += x.same; if (t.total != null) { t.total += x.total; t.out += x.out; } });
+    return t;
+  });
+  const total = { cells: cellsFor(sums) };
+  // heat colours per % column across the hub rows and the total row, like the Excel colour scales
+  // (Sheet 1: high = green; Sheet 2: out-of-TAT %, high = red)
+  for (let j = 0; j < total.cells.length; j++) {
+    if (!total.cells[j].c) continue;
+    const sc = feScale(rows.map(r => r.cells[j].v).concat([total.cells[j].v]), tat);
+    rows.concat([total]).forEach(r => { const c = r.cells[j]; c.bg = sc && c.v != null ? scaleColorPerf(tat ? -c.v : c.v, sc) : null; });
+  }
+  rows.concat([total]).forEach(r => r.cells.forEach(c => { c.t = feFmt(c.k, c.v); }));
+  const dl = d => { const p = d.split('-'); return (+p[2]) + '-' + FE_MONTHS[+p[1] - 1]; };
+  const cols = tat ? dates.flatMap(d => [dl(d) + ' Total', dl(d) + ' Out TAT']).concat(dates.map(d => dl(d) + ' out TAT%'))
+                   : dates.map(d => fmtDateLong(d)).concat(dates.map(d => fmtDateLong(d)));
+  return {
+    tab: { id: tab.id, name: tab.name, short: tab.short }, dates, n, short: n < (tat ? FE_W2 : FE_W1),
+    latest: n ? fmtDateLong(dates[n - 1]) : '', latestIso: n ? dates[n - 1] : '',
+    groupHead: tat ? null : [{ label: 'No of Trips', span: n }, { label: '% of Same Route taken by Rider', span: n }],
+    first: tat ? 'Branch' : 'Hub', totalLabel: tat ? 'GRAND TOTAL' : 'Overall', cols, rows, total, hidden, fresh
+  };
+}
+
+function feTableHTML(d, opts) {
+  opts = opts || {};
+  const fresh = new Set(d.fresh.map(x => x.key));
+  let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm"' + (d.groupHead ? ' rowspan="2"' : '') + '>' + esc(d.first) + '</th>';
+  if (d.groupHead) h += d.groupHead.map(g => '<th colspan="' + g.span + '">' + esc(g.label) + '</th>').join('') + '</tr><tr>';
+  h += d.cols.map(c => '<th>' + esc(c) + '</th>').join('') + '</tr></thead><tbody>';
+  const tds = (cells, fill) => cells.map(c => { const bg = c.bg || fill; return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + esc(c.t) + '</td>'; }).join('');
+  d.rows.forEach(r => {
+    h += '<tr><td class="nm">' + esc(r.name) + (!opts.static && fresh.has(r.key) ? '<span class="pill">NEW</span>' : '') +
+      (opts.static ? '' : '<button class="x" data-ferm="' + esc(r.key) + '" title="Leave out ' + esc(r.name) + '" aria-label="Leave out ' + esc(r.name) + '">&times;</button>') + '</td>' + tds(r.cells, null) + '</tr>';
+  });
+  return h + '<tr class="tot"><td class="nm" style="background:#D9E1F2">' + esc(d.totalLabel) + '</td>' + tds(d.total.cells, '#D9E1F2') + '</tr></tbody></table></div>';
+}
+
+function renderFe() {
+  const host = $('#results');
+  if (!feHasHistory()) {
+    host.innerHTML = '<div class="panel"><div class="empty"><b>No FE Dashboard data yet</b>Drop the raw FE reach report. The first time, also drop your current dashboard Excel once, so the earlier days are loaded (the raw file only holds two days).</div></div>';
+    return;
+  }
+  if (!FE_TABS.some(t => t.id === state.feTab)) state.feTab = 'trips';
+  const d = computeFe(state.feTab), anyShare = canShareFiles();
+  let html = '<div class="bar">' +
+    '<button class="btn primary" id="pubBtn" title="Update your shared link with these tables">Publish to link</button>' +
+    '<button class="btn" id="dlFeAll">Save both images</button>' +
+    (anyShare ? '<button class="btn" id="shFeAll">Share both&hellip;</button>' : '') +
+    '<button class="btn" id="dlFeXls">Download Excel</button>' +
+    '<button class="link" id="clrFe">Clear saved days</button><span class="sp"></span>' +
+    '<label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add title and date on images</label></div>';
+  html += '<div class="slots" aria-label="Sheets" style="margin-bottom:14px">' + FE_TABS.map(t => {
+    const c = computeFe(t.id);
+    return '<button type="button" class="slot filled' + (state.feTab === t.id ? ' sel' : '') + '" data-fetab="' + t.id + '" tabindex="0"><span class="zn">' + esc(t.name) + '</span><span class="st">' + c.rows.length + ' hub' + (c.rows.length === 1 ? '' : 's') + ' &middot; ' + c.n + ' day' + (c.n === 1 ? '' : 's') + '</span>' + (c.fresh.length ? '<span class="flag">' + c.fresh.length + ' new</span>' : '') + '</button>';
+  }).join('') + '</div>';
+  html += '<section class="panel" aria-label="' + esc(d.tab.name) + ' table"><div class="phead"><h2>' + esc(d.tab.name) + '<span class="meta">Data up to ' + esc(d.latest) + '</span></h2>' +
+    '<div class="pact"><button class="btn small" id="dlFePng">Save image</button><button class="btn small" id="cpFePng">Copy image</button>' + (anyShare ? '<button class="btn small" id="shFePng">Share&hellip;</button>' : '') + '</div></div>';
+  if (d.short) html += '<p class="note" style="margin:8px 16px">Only ' + d.n + ' day' + (d.n === 1 ? '' : 's') + ' saved so far (this sheet shows up to ' + (d.tab.id === 'tat' ? FE_W2 : FE_W1) + '). Drop your current dashboard Excel once to load the earlier days.</p>';
+  if (d.fresh.length) {
+    html += '<div class="newstrip"><p>' + (d.fresh.length === 1 ? 'New hub in the data' : d.fresh.length + ' new hubs in the data') + ' &mdash; not seen before. Included for now. Choose whether each one stays.</p>' +
+      d.fresh.map(r => '<div class="newrow"><span class="nm">' + esc(r.name) + '</span><span class="ans"><button class="btn small" data-fekeep="' + esc(r.key) + '">Keep in table</button><button class="btn small" data-feout="' + esc(r.key) + '">Leave out</button></span></div>').join('') + '</div>';
+  }
+  html += d.rows.length ? feTableHTML(d) : '<div class="empty"><b>No hubs in this table</b>Add some back from the list below.</div>';
+  if (d.hidden.length) {
+    html += '<div class="tray"><p>Left out of this table (' + d.hidden.length + '). Click one to add it back.</p><div class="chips">' +
+      d.hidden.map(r => '<button class="chip" data-feadd="' + esc(r.key) + '">' + esc(r.name) + '</button>').join('') + '</div></div>';
+  }
+  host.innerHTML = html + '</section>';
+  const ids = FE_TABS.map(t => t.id);
+  $('#pubBtn').onclick = startPublish;
+  $('#dlFeAll').onclick = () => saveFeImages(ids);
+  if ($('#shFeAll')) $('#shFeAll').onclick = () => shareFeImages(ids);
+  $('#dlFeXls').onclick = downloadFeExcel;
+  $('#clrFe').onclick = clearFeDays;
+  $('#dlFePng').onclick = () => saveFeImages([state.feTab]);
+  $('#cpFePng').onclick = () => copyFeImage(state.feTab);
+  if ($('#shFePng')) $('#shFePng').onclick = () => shareFeImages([state.feTab]);
+  $('#optTitle').onchange = e => { state.showTitle = e.target.checked; };
+  host.querySelectorAll('[data-fetab]').forEach(b => b.onclick = () => { state.feTab = b.dataset.fetab; render(); });
+  host.querySelectorAll('[data-ferm],[data-feout]').forEach(b => b.onclick = () => feSetChoice(b.dataset.ferm || b.dataset.feout, 'out'));
+  host.querySelectorAll('[data-feadd],[data-fekeep]').forEach(b => b.onclick = () => feSetChoice(b.dataset.feadd || b.dataset.fekeep, 'in'));
+}
+
+/* ---- image ---- */
+function drawFe(d, withTitle) {
+  const S = 3, pad = 14, rowH = 24, hasG = !!d.groupHead, gH = hasG ? 24 : 0, cH = hasG ? 26 : 44, headTot = gH + cH;
+  const colW = hasG ? 86 : 94, ncols = d.cols.length;
+  const mc = document.createElement('canvas').getContext('2d'); mc.font = 'bold 12px Arial, Helvetica, sans-serif';
+  let w0 = 110; d.rows.concat([{ name: d.totalLabel }]).forEach(r => { w0 = Math.max(w0, Math.ceil(mc.measureText(r.name).width) + 24); });
+  const tableW = w0 + colW * ncols, W = tableW + pad * 2, H = pad * 2 + (withTitle ? 30 : 0) + headTot + rowH * (d.rows.length + 1);
+  const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S;
+  const ctx = cv.getContext('2d'); ctx.scale(S, S);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); ctx.textBaseline = 'middle';
+  const box = (x, y, w, h, fill) => { if (fill) { ctx.fillStyle = fill; ctx.fillRect(x, y, w, h); } ctx.strokeStyle = '#8A9199'; ctx.lineWidth = 1; ctx.strokeRect(x + .5, y + .5, w - 1, h - 1); };
+  let y = pad;
+  if (withTitle) {
+    ctx.fillStyle = '#141D26'; ctx.font = 'bold 18px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left'; ctx.fillText('FE Dashboard \u2013 ' + d.tab.name, pad, y + 14);
+    ctx.fillStyle = '#5B6773'; ctx.font = '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'right'; ctx.fillText('Data up to ' + d.latest, W - pad, y + 15);
+    y += 30;
+  }
+  ctx.font = 'bold 11px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+  box(pad, y, w0, headTot, '#D9E1F2'); ctx.fillStyle = '#000'; ctx.fillText(d.first, pad + w0 / 2, y + headTot / 2 + 1);
+  if (hasG) {
+    let gx = pad + w0;
+    d.groupHead.forEach(g => { box(gx, y, colW * g.span, gH, '#D9E1F2'); ctx.fillStyle = '#000'; ctx.fillText(g.label, gx + colW * g.span / 2, y + gH / 2 + 1); gx += colW * g.span; });
+  }
+  d.cols.forEach((c, i) => {
+    const x = pad + w0 + colW * i, top = y + gH;
+    box(x, top, colW, cH, '#D9E1F2'); ctx.fillStyle = '#000';
+    const lines = wrapLines(ctx, c, colW - 8), lh = 12, t0 = top + cH / 2 - (lines.length * lh) / 2 + lh / 2;
+    lines.forEach((ln, j) => ctx.fillText(ln, x + colW / 2, t0 + j * lh));
+  });
+  y += headTot;
+  const row = (name, cells, bold, fill) => {
+    ctx.font = (bold ? 'bold ' : '') + '12px Arial, Helvetica, sans-serif';
+    box(pad, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.fillText(name, pad + w0 / 2, y + rowH / 2 + 1);
+    cells.forEach((c, i) => { const x = pad + w0 + colW * i; box(x, y, colW, rowH, c.bg || fill); ctx.fillStyle = '#000'; ctx.fillText(c.t, x + colW / 2, y + rowH / 2 + 1); });
+    y += rowH;
+  };
+  d.rows.forEach(r => row(r.name, r.cells, false, null));
+  row(d.totalLabel, d.total.cells, true, '#D9E1F2');
+  return cv;
+}
+const feFileName = (d, ext) => 'FE_' + d.tab.short + '_' + d.latestIso + '.' + ext;
+function feBlob(tabId) {
+  const d = computeFe(tabId);
+  return new Promise((res, rej) => drawFe(d, state.showTitle).toBlob(b => b ? res({ blob: b, name: feFileName(d, 'png') }) : rej(new Error('Image failed')), 'image/png'));
+}
+async function saveFeImages(ids) { try { for (const id of ids) { const r = await feBlob(id); saveBlob(r.blob, r.name); await new Promise(z => setTimeout(z, 250)); } toast(ids.length > 1 ? 'Saved ' + ids.length + ' images' : 'Saved image'); } catch (e) { toast(e.message, true); } }
+async function copyFeImage(id) {
+  try {
+    if (!(navigator.clipboard && window.ClipboardItem)) throw new Error('Copy is not supported here. Use Save image instead.');
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': feBlob(id).then(r => r.blob) })]);
+    toast('Image copied. Paste it into WhatsApp.');
+  } catch (e) { toast(e.message && /supported/.test(e.message) ? e.message : 'Could not copy. Use Save image instead.', true); }
+}
+async function shareFeImages(ids) {
+  try {
+    const files = []; for (const id of ids) { const r = await feBlob(id); files.push(new File([r.blob], r.name, { type: 'image/png' })); }
+    await navigator.share({ files, title: 'FE Dashboard ' + computeFe('trips').latest });
+  } catch (e) { if (e.name !== 'AbortError') toast('Sharing was not possible. Use Save image instead.', true); }
+}
+
+/* ---- Excel: Sheet1 / Sheet2 laid out like the current dashboard ---- */
+async function downloadFeExcel() {
+  if (!feHasHistory()) return;
+  try {
+    const wb = new ExcelJS.Workbook(); wb.created = new Date();
+    const thin = { style: 'thin' }, border = { top: thin, left: thin, bottom: thin, right: thin };
+    const fill = argb => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+    const CENTER = { horizontal: 'center', vertical: 'middle' };
+    FE_TABS.forEach((tab, ti) => {
+      const d = computeFe(tab.id), ws = wb.addWorksheet('Sheet' + (ti + 1)), n = d.n, tat = tab.id === 'tat';
+      const nc = d.cols.length;
+      ws.getColumn(1).width = 24;
+      for (let c = 2; c <= nc + 1; c++) ws.getColumn(c).width = tat ? 19 : 11.5;
+      let r = 1;
+      if (!tat) {
+        ws.mergeCells(1, 1, 2, 1); ws.mergeCells(1, 2, 1, n + 1); ws.mergeCells(1, n + 2, 1, 2 * n + 1);
+        [[1, 1, d.first], [1, 2, d.groupHead[0].label], [1, n + 2, d.groupHead[1].label]].forEach(a => { const c = ws.getCell(a[0], a[1]); c.value = a[2]; c.font = { bold: true }; c.alignment = CENTER; });
+        for (let c = 1; c <= 2 * n + 1; c++) { ws.getCell(1, c).border = border; ws.getCell(2, c).border = border; }
+        d.dates.concat(d.dates).forEach((iso, i) => { const p = iso.split('-'), c = ws.getCell(2, i + 2); c.value = new Date(Date.UTC(+p[0], +p[1] - 1, +p[2])); c.numFmt = 'dd-mmm-yyyy'; c.font = { bold: true }; c.alignment = CENTER; c.border = border; });
+        r = 3;
+      } else {
+        const h = ws.getCell(1, 1); h.value = d.first; h.font = { bold: true }; h.alignment = CENTER; h.border = border;
+        d.cols.forEach((l, i) => { const c = ws.getCell(1, i + 2); c.value = l; c.font = { bold: true }; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; c.border = border; });
+        ws.getRow(1).height = 30; r = 2;
+      }
+      const first = r;
+      const put = (name, cells, bold, bg) => {
+        const nm = ws.getCell(r, 1); nm.value = name; nm.alignment = CENTER; nm.border = border; if (bold) nm.font = { bold: true }; if (bg) nm.fill = fill(bg);
+        cells.forEach((x, i) => {
+          const c = ws.getCell(r, i + 2); c.value = x.v; c.border = border; c.alignment = { horizontal: 'right', vertical: 'middle' };
+          c.numFmt = x.k === 'pct2' ? '0.00%' : x.k === 'pct0' ? '0%' : '#,##0';
+          if (bold) c.font = { bold: true }; if (bg && !x.c) c.fill = fill(bg);
+        });
+        r++;
+      };
+      d.rows.forEach(x => put(x.name, x.cells, false, null));
+      put(d.totalLabel, d.total.cells, true, 'FFD9E1F2');
+      d.total.cells.forEach((x, i) => {
+        if (!x.c) return;
+        const L = openpyxlCol(i + 2), cols = tat ? ['FF63BE7B', 'FFFFEB84', 'FFF8696B'] : ['FFF8696B', 'FFFFEB84', 'FF63BE7B'];
+        ws.addConditionalFormatting({ ref: L + first + ':' + L + (r - 1), rules: [{ type: 'colorScale', priority: 1, cfvo: [{ type: 'min' }, { type: 'percentile', value: 50 }, { type: 'max' }], color: cols.map(a => ({ argb: a })) }] });
+      });
+    });
+    const name = 'FE_REACH_DASHBOARD_' + todayISO() + '.xlsx';
+    saveBlob(new Blob([await wb.xlsx.writeBuffer()], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), name);
+    toast('Saved ' + name);
+  } catch (e) { console.error(e); toast('Excel could not be created: ' + e.message, true); }
+}
+
+/* ==========================================================================
    TOP-LEVEL RENDER
    ========================================================================== */
 function render() {
@@ -2781,13 +3159,13 @@ function render() {
   if (state.report === 'ofd') { renderSlots(); renderHint(); renderFix(); renderOfd(); }
   else {
     $('#slots').innerHTML = ''; $('#hint').innerHTML = ''; $('#fix').innerHTML = '';
-    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : state.report === 'dso' ? renderDso() : renderDs();
+    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : state.report === 'dso' ? renderDso() : state.report === 'fe' ? renderFe() : renderDs();
   }
   const rs = $('#foot-reset');
-  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : 'DS Performance';
+  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : state.report === 'fe' ? 'FE Dashboard' : 'DS Performance';
   rs.innerHTML = '<button class="link" id="pubSettings">Publish settings</button> &nbsp; <button class="link" id="resetChoices">Forget saved ' + which + ' choices</button>' +
     (storageOK ? '' : ' <span>(this browser is not allowing saved settings)</span>');
-  $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : resetDsHistory(); };
+  $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : state.report === 'fe' ? resetFeChoices() : resetDsHistory(); };
   $('#pubSettings').onclick = () => showPubSetup();
 }
 
@@ -2874,7 +3252,9 @@ function buildReportHTML() {
   const haveDs = dsDates.length > 0;
   const dsoTabs = dsoFile() ? DSO_TABS.map(tb => ({ id: tb.id, d: computeDso(tb.id) })).filter(x => x.d && x.d.sections[0].rows.length) : [];
   const haveDso = dsoTabs.length > 0;
-  if (!haveOfd && !havePerf && !haveCod && !haveDs && !haveDso) return null;
+  const feTabs = feHasHistory() ? FE_TABS.map(tb => ({ id: tb.id, d: computeFe(tb.id) })).filter(x => x.d && x.d.rows.length) : [];
+  const haveFe = feTabs.length > 0;
+  if (!haveOfd && !havePerf && !haveCod && !haveDs && !haveDso && !haveFe) return null;
 
   const css = ':root{--ink:#141D26;--muted:#5B6773;--rule:#CBD3DB;--accent:#1F4E9E;--hdr:#D9E1F2;--ground:#E9EDF1}' +
     '*{box-sizing:border-box}body{margin:0;background:var(--ground);color:var(--ink);font:15px/1.45 "Bahnschrift","DIN Alternate","Avenir Next","Segoe UI",system-ui,-apple-system,Roboto,sans-serif}' +
@@ -2912,7 +3292,8 @@ function buildReportHTML() {
     perf: perfData ? perfData.map(x => ({ view: x.view, dates: x.dates.map(dt => ({ date: dt, file: perfImgName(x.view, dt), day: perfDay(x.view, dt) })) })) : null,
     cod: codData ? codData.map(x => ({ region: x.region, file: codImgName(x.region), d: x.d })) : null,
     ds: dsData ? { dates: dsDates, file: dsImgName(), zones: dsData } : null,
-    dso: haveDso ? dsoTabs.map(x => ({ file: dsoFileName(x.d, 'png'), d: x.d })) : null
+    dso: haveDso ? dsoTabs.map(x => ({ file: dsoFileName(x.d, 'png'), d: x.d })) : null,
+    fe: haveFe ? feTabs.map(x => ({ file: feFileName(x.d, 'png'), d: x.d })) : null
   };
 
   const drawSrc = 'const HEADERS=' + JSON.stringify(HEADERS) + ',COL_W=' + JSON.stringify(COL_W) + ',PCT_COLS=' + JSON.stringify(PCT_COLS) +
@@ -2923,7 +3304,7 @@ function buildReportHTML() {
     ',DSO_HEAD=' + JSON.stringify(DSO_HEAD) + ',DSO_PCTV=' + JSON.stringify(DSO_PCTV) + ',DSO_COL_W=' + JSON.stringify(DSO_COL_W) + ';' +
     'const MON=' + JSON.stringify(MON) + ';const fmtInt=' + fmtInt + ';const fmtPct=' + fmtPct + ';const fmtDateLong=' + fmtDateLong + ';' +
     'var DATA=' + jsonForScript(runtimeData) + ';const stampText=function(){return DATA.stamp};\n' +
-    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso].join('\n');
+    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso, feFmt, drawFe].join('\n');
 
   const uiSrc = '(function(){' +
     'var rt=[].slice.call(document.querySelectorAll("[data-rtab]")),rs=[].slice.call(document.querySelectorAll(".rsec"));' +
@@ -2943,6 +3324,8 @@ function buildReportHTML() {
     '[].slice.call(document.querySelectorAll("[data-dsimg]")).forEach(function(b){b.onclick=function(){dsBlob().then(function(bl){saveAs(bl,DATA.ds.file)})}});' +
     'function dsoBlobAt(i){var c=DATA.dso[i];var cv=drawDso(c.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-dimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.dimg;dsoBlobAt(i).then(function(bl){saveAs(bl,DATA.dso[i].file)})}});' +
+    'function feBlobAt(i){var c=DATA.fe[i];var cv=drawFe(c.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
+    '[].slice.call(document.querySelectorAll("[data-feimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.feimg;feBlobAt(i).then(function(bl){saveAs(bl,DATA.fe[i].file)})}});' +
     '})();';
 
   let body = '<div class="wrap"><h1>Daily reports</h1><p class="up">Updated ' + esc(stampText()) + '</p>';
@@ -2952,6 +3335,7 @@ function buildReportHTML() {
   if (haveCod) rtabs.push(['cod', 'COD Pendency']);
   if (haveDs) rtabs.push(['ds', 'DS Performance']);
   if (haveDso) rtabs.push(['dso', 'DS OFD']);
+  if (haveFe) rtabs.push(['fe', 'FE Dashboard']);
   if (rtabs.length > 1) body += '<div class="tabs" role="group" aria-label="Report">' + rtabs.map(([id, n]) => '<button type="button" data-rtab="' + id + '" aria-pressed="false">' + esc(n) + '</button>').join('') + '</div>';
 
   if (haveOfd) {
@@ -3001,6 +3385,15 @@ function buildReportHTML() {
     dsoTabs.forEach((x, i) => {
       body += '<section data-sec="do' + i + '" class="panel" hidden><div class="ph"><h2>' + esc(x.d.tab.name) + '<span class="meta">Data as of ' + esc(x.d.stampLabel) + '</span></h2><button type="button" data-dimg="' + i + '">Save as image</button></div>' +
         dsoTableHTML(x.d, { static: true }) + '</section>';
+    });
+    body += '</div>';
+  }
+  if (haveFe) {
+    body += '<div class="rsec" id="r-fe"' + (rtabs.length > 1 ? ' hidden' : '') + '>';
+    body += '<div class="tabs" role="group" aria-label="Sheets">' + feTabs.map((x, i) => '<button type="button" data-tab="fe' + i + '" aria-pressed="false">' + esc(x.d.tab.name) + '</button>').join('') + '</div>';
+    feTabs.forEach((x, i) => {
+      body += '<section data-sec="fe' + i + '" class="panel" hidden><div class="ph"><h2>' + esc(x.d.tab.name) + '<span class="meta">Data up to ' + esc(x.d.latest) + '</span></h2><button type="button" data-feimg="' + i + '">Save as image</button></div>' +
+        feTableHTML(x.d, { static: true }) + '</section>';
     });
     body += '</div>';
   }
@@ -3165,6 +3558,7 @@ loadPerf();
 loadCod();
 loadDs();
 loadDso();
+loadFe();
 loadPub();
 render();
 </script>
