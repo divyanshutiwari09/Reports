@@ -463,7 +463,7 @@ const deepCopy = o => JSON.parse(JSON.stringify(o));
 function parseOfdRows(rows, head) {
   const idx = {};
   OFD_REQUIRED.forEach(c => { idx[c] = head.indexOf(c.toLowerCase()); });
-  const pktCol = head.indexOf('packet type');   // optional: when present, only NDD packets are counted
+  const pktCol = head.indexOf('Service Type');   // optional: when present, only NDD packets are counted
   const branches = new Map();
   let unassigned = 0, total = 0, skippedNonNdd = 0;
   for (let r = 1; r < rows.length; r++) {
