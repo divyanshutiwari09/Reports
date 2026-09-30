@@ -259,7 +259,8 @@ const REPORTS = [
   { id: 'cod',  name: 'COD Pendency' },
   { id: 'ds',   name: 'DS Performance' },
   { id: 'dso',  name: 'DS OFD' },
-  { id: 'fe',   name: 'FE Dashboard' }
+  { id: 'fe',   name: 'FE Dashboard' },
+  { id: 'sla',  name: 'SLA/FASR/OFD' }
 ];
 
 /* ---- OFD report ---- */
@@ -309,6 +310,7 @@ const DS_PCT = [1, 2, 3, 4];
 const DS_COL_W = [72, 68, 78, 60, 64];
 const DSO_EXTRA = ['STATUS', 'PACKED', 'OFD', 'ATTEMPT COMPLIANCE', 'EDD TIME'];
 const FE_REQUIRED = ['DATE', 'DELIVERY CENTRE', 'PAYOUT TYPE', 'ALLOCATED ROUTE', 'ACTUAL ROUTE', 'TOTAL DELIVERY', 'OUT OF TAT DELIVERY'];
+const SLA_REQUIRED = ['REACHED_HUB_TIMESTAMP', 'ATTEMPT 1 TIME', 'DELIVERED_TIMESTAMP', 'OUT_FOR_DELIVERY_TIMESTAMP', 'OTP_VERIFIED_TIMESTAMP', 'CANCELLED_TIMESTAMP', 'PAYMENT TYPE', 'ARRIVED AT WAREHOUSE'];
 const DS_WINDOW = 2;     // days shown on screen, in the image and on the shared page
 const DS_CLEAN_DAY = 4;  // last month is cleared once the report date reaches this day
 const COD_BUCKET_KEYS = ['1', '2', '3', '4-5', '6-30', '>30'];
@@ -461,12 +463,17 @@ const deepCopy = o => JSON.parse(JSON.stringify(o));
 function parseOfdRows(rows, head) {
   const idx = {};
   OFD_REQUIRED.forEach(c => { idx[c] = head.indexOf(c.toLowerCase()); });
+  const pktCol = head.indexOf('packet type');   // optional: when present, only NDD packets are counted
   const branches = new Map();
-  let unassigned = 0, total = 0;
+  let unassigned = 0, total = 0, skippedNonNdd = 0;
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
     if (!row || !row.length) continue;
     total++;
+    if (pktCol >= 0) {
+      const pkt = row[pktCol] == null ? '' : String(row[pktCol]).trim().toUpperCase();
+      if (pkt !== 'NDD') { skippedNonNdd++; continue; }
+    }
     let name = row[idx['Delivery Centre']];
     name = name == null ? '' : String(name).trim();
     if (!name || name.toLowerCase() === 'nan') { unassigned++; continue; }
@@ -488,7 +495,7 @@ function parseOfdRows(rows, head) {
     }
     if (non && fresh) a.nonNew++;
   }
-  return { kind: 'ofd', branches, unassigned, rows: total };
+  return { kind: 'ofd', branches, unassigned, rows: total, skippedNonNdd, hasPacketType: pktCol >= 0 };
 }
 
 /* Daily performance: cleaning rules 1a-1d, the five views, and per-hub counters.
@@ -850,6 +857,85 @@ function parseFeDash(buf) {
   return { kind: 'fedash', days, rows: count };
 }
 
+/* ---- Daily SLA / FASR / OFD report: Summary only. One raw file replaces the previous entirely; no history. ---- */
+function slaParseTS(v) {
+  if (v == null || v === '') return null;
+  if (v instanceof Date) { if (isNaN(v.getTime())) return null; return Date.UTC(v.getFullYear(), v.getMonth(), v.getDate(), v.getHours(), v.getMinutes(), v.getSeconds()); }
+  if (typeof v === 'number') { const whole = Math.floor(v), frac = v - whole; return Math.round((whole - 25569) * 86400000 + frac * 86400000); }
+  const s = String(v).trim(); if (!s) return null;
+  let m = /^(\d{1,2})-(\d{1,2})-(\d{4})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(s);
+  if (m) return Date.UTC(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +(m[6] || 0));
+  m = /^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(s);
+  if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+  m = /^(\d{1,2})-(\d{1,2})-(\d{4})$/.exec(s);
+  if (m) return Date.UTC(+m[3], +m[2] - 1, +m[1]);
+  const d = new Date(s); return isNaN(d.getTime()) ? null : d.getTime();
+}
+function slaDateOnly(ms) { return ms == null ? null : Math.floor(ms / 86400000) * 86400000; }
+function slaSecOfDay(ms) { const d = new Date(ms); return d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds(); }
+function slaDateSlug(ms) { const d = new Date(ms); return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0'); }
+function slaBlank() {
+  return { total: 0, slaNew: 0, slaOldNum: 0, ppdSdNum: 0, ppdSdDen: 0, codSdNum: 0, codSdDen: 0, dvSdNum: 0, dvSdDen: 0,
+    ofd830: 0, ofd930: 0, ppdMatNum: 0, ppdMatDen: 0, codMatNum: 0, codMatDen: 0, dvMatNum: 0 };
+}
+function parseSlaRows(rows, head) {
+  const col = n => head.indexOf(n.toLowerCase());
+  const C = { rad: col('REACHED_HUB_TIMESTAMP'), att1: col('ATTEMPT 1 TIME'), del: col('DELIVERED_TIMESTAMP'),
+    ofd: col('OUT_FOR_DELIVERY_TIMESTAMP'), otp: col('OTP_VERIFIED_TIMESTAMP'), canc: col('CANCELLED_TIMESTAMP'), pay: col('PAYMENT TYPE') };
+  const S = v => (v == null ? '' : String(v).trim());
+  const days = new Map(), grand = slaBlank();
+  let total = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    const radMs = slaParseTS(row[C.rad]); if (radMs == null) continue;    // every metric is keyed off RAD (reached-hub) being present
+    total++;
+    const radDate = slaDateOnly(radMs), iso = slaDateSlug(radDate);
+    let day = days.get(iso); if (!day) { day = slaBlank(); days.set(iso, day); }
+
+    const att1Ms = slaParseTS(row[C.att1]);
+    const att1Date = att1Ms == null ? null : slaDateOnly(att1Ms);
+    const diffIsNA = att1Date == null;
+    const diff = diffIsNA ? null : Math.round((att1Date - radDate) / 86400000);
+    const delMs = slaParseTS(row[C.del]);
+    const delDate = delMs == null ? null : slaDateOnly(delMs);
+    const fasr = (diffIsNA || delDate == null) ? null : Math.round((delDate - att1Date) / 86400000);
+    const pay = S(row[C.pay]);
+    const otpMs = slaParseTS(row[C.otp]), cancMs = slaParseTS(row[C.canc]), ofdMs = slaParseTS(row[C.ofd]);
+
+    const bump = a => {
+      a.total++;
+      if (diff === 0) a.slaNew++;
+      if (!diffIsNA) {
+        a.slaOldNum++;
+        if (pay === 'PREPAID') { a.ppdMatDen++; if (fasr === 0) a.ppdMatNum++; }
+        if (pay === 'COD') { a.codMatDen++; if (fasr === 0) a.codMatNum++; }
+        if (otpMs != null || cancMs != null) a.dvMatNum++;
+      }
+      if (diff === 0) {
+        if (pay === 'PREPAID') { a.ppdSdDen++; if (fasr === 0) a.ppdSdNum++; }
+        if (pay === 'COD') { a.codSdDen++; if (fasr === 0) a.codSdNum++; }
+        a.dvSdDen++;
+        if ((otpMs != null && slaDateOnly(otpMs) === radDate) || (cancMs != null && slaDateOnly(cancMs) === radDate)) a.dvSdNum++;
+      }
+      if (ofdMs != null) {
+        const sec = slaSecOfDay(ofdMs);
+        if (sec < 30600) a.ofd830++;      // 8*3600+30*60
+        if (sec < 34200) a.ofd930++;      // 9*3600+30*60
+      }
+    };
+    bump(day); bump(grand);
+  }
+  if (!days.size) throw new Error('No rows with a REACHED_HUB_TIMESTAMP date were found.');
+  return { kind: 'sla', days, grand, total, dates: Array.from(days.keys()).sort(), rows: total };
+}
+function slaMetrics(a) {
+  return [a.total,
+    a.total ? a.slaNew / a.total : null, a.ppdSdDen ? a.ppdSdNum / a.ppdSdDen : null, a.codSdDen ? a.codSdNum / a.codSdDen : null,
+    a.dvSdDen ? a.dvSdNum / a.dvSdDen : null, a.total ? a.ofd830 / a.total : null, a.total ? a.ofd930 / a.total : null,
+    a.total ? a.slaOldNum / a.total : null, a.ppdMatDen ? a.ppdMatNum / a.ppdMatDen : null, a.codMatDen ? a.codMatNum / a.codMatDen : null,
+    a.slaOldNum ? a.dvMatNum / a.slaOldNum : null];
+}
+
 function parseAny(buf, name) {
   const names = XLSX.read(buf, { type: 'array', bookSheets: true }).SheetNames;
   if (names.indexOf('Sheet1') >= 0 && names.indexOf('Sheet2') >= 0) {
@@ -868,7 +954,7 @@ function parseAny(buf, name) {
   if (!rows.length) throw new Error('The sheet is empty.');
   const head = rows[0].map(h => String(h == null ? '' : h).trim().toLowerCase());
   const missing = list => list.filter(c => head.indexOf(c.toLowerCase()) < 0);
-  const mc = missing(COD_NEEDED), mp = missing(PERF_REQUIRED), mo = missing(OFD_REQUIRED), md = missing(DS_REQUIRED), mf = missing(FE_REQUIRED);
+  const mc = missing(COD_NEEDED), mp = missing(PERF_REQUIRED), mo = missing(OFD_REQUIRED), md = missing(DS_REQUIRED), mf = missing(FE_REQUIRED), ms = missing(SLA_REQUIRED);
   if (!mc.length) return parseCodRows(rows, head);
   if (!mp.length) return parsePerfRows(rows, head);
   if (!mo.length) return parseOfdRows(rows, head);
@@ -878,8 +964,9 @@ function parseAny(buf, name) {
     return r;
   }
   if (!mf.length) return parseFeRows(rows, head);
-  const opts = [{ n: 'COD Pendency', m: mc }, { n: 'Daily performance', m: mp }, { n: 'OFD', m: mo }, { n: 'DS Performance', m: md }, { n: 'FE Dashboard', m: mf }].sort((a, b) => a.m.length - b.m.length);
-  throw new Error('Not recognised as an OFD, Daily performance, COD Pendency, DS Performance or FE Dashboard file. Closest match is ' + opts[0].n + ', missing: ' + opts[0].m.join(', '));
+  if (!ms.length) return parseSlaRows(rows, head);
+  const opts = [{ n: 'COD Pendency', m: mc }, { n: 'Daily performance', m: mp }, { n: 'OFD', m: mo }, { n: 'DS Performance', m: md }, { n: 'FE Dashboard', m: mf }, { n: 'SLA/FASR/OFD', m: ms }].sort((a, b) => a.m.length - b.m.length);
+  throw new Error('Not recognised as an OFD, Daily performance, COD Pendency, DS Performance, FE Dashboard or SLA/FASR/OFD file. Closest match is ' + opts[0].n + ', missing: ' + opts[0].m.join(', '));
 }
 
 /* ---- background workers ---- */
@@ -890,10 +977,11 @@ function getWorkerURL() {
   const lib = document.getElementById('xlsx-src').textContent;
   const code = lib + '\n;const OFD_REQUIRED=' + JSON.stringify(OFD_REQUIRED) + ',PERF_REQUIRED=' + JSON.stringify(PERF_REQUIRED) +
     ',PERF_DROP=' + JSON.stringify(PERF_DROP) + ',COD_REQUIRED=' + JSON.stringify(COD_REQUIRED) + ',COD_NEEDED=' + JSON.stringify(COD_NEEDED) +
-    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) +
+    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) + ',SLA_REQUIRED=' + JSON.stringify(SLA_REQUIRED) +
     ';const bkey=' + bkey + ';const isY=' + isY + ';\n' +
     parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
-    dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + feSame + '\n' + parseFeRows + '\n' + parseFeDash + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
+    dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + feSame + '\n' + parseFeRows + '\n' + parseFeDash +
+    '\n' + slaParseTS + '\n' + slaDateOnly + '\n' + slaSecOfDay + '\n' + slaDateSlug + '\n' + slaBlank + '\n' + parseSlaRows + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
     'self.onmessage=function(e){try{self.postMessage({ok:true,p:parseAny(e.data.buf,e.data.name)});}catch(err){self.postMessage({ok:false,msg:String((err&&err.message)||err)});}};';
   workerURL = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   return workerURL;
@@ -977,6 +1065,10 @@ async function processOne(f, rec) {
         toast(f.name + ': orders are for ' + fmtDateLong(p.date) + ' (a finished day), so it went to DS Performance only.');
         if (!state.picked) state.report = 'ds';
       }
+    } else if (p.kind === 'sla') {
+      state.files.filter(x => x !== rec && x.kind === 'sla').forEach(x => { state.files = state.files.filter(y => y !== x); });
+      rec.sla = p; rec.rows = p.rows;
+      if (!state.picked) state.report = 'sla';
     } else if (p.kind === 'fe') {
       rec.rows = p.rows; applyFeRaw(p);
       toast(f.name + ': added ' + fmtDateLong(p.date) + ' to FE Dashboard history.');
@@ -987,7 +1079,7 @@ async function processOne(f, rec) {
       if (!state.picked) state.report = 'fe';
 
     } else {
-      rec.branches = p.branches; rec.rows = p.rows; rec.unassigned = p.unassigned;
+      rec.branches = p.branches; rec.rows = p.rows; rec.unassigned = p.unassigned; rec.skippedNonNdd = p.skippedNonNdd; rec.hasPacketType = p.hasPacketType;
       const z = detectZone(p.branches);
       if (z) {
         const prev = state.files.find(x => x !== rec && x.kind === 'ofd' && x.zone === z);
@@ -1031,7 +1123,7 @@ async function addFiles(fileList) {
   render();
 }
 
-const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : id === 'fe' ? feHasHistory() : false;
+const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : id === 'fe' ? feHasHistory() : id === 'sla' ? !!slaFile() : false;
 
 
 /* ==========================================================================
@@ -1134,6 +1226,7 @@ function renderOfd() {
   if (!loaded.length) { host.innerHTML = '<div class="panel"><div class="empty"><b>No OFD files yet</b>Drop the four OFD raw files to see the tables.</div></div>'; return; }
   if (!zoneFile(state.sel)) state.sel = loaded[0];
   const d = computeZone(state.sel);
+  const zf = zoneFile(state.sel);
 
   const anyShare = canShareFiles();
   let html = '<div class="bar">' +
@@ -1144,6 +1237,11 @@ function renderOfd() {
     '<span class="sp"></span>' +
     '<label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add zone name and date on images</label>' +
     '</div>';
+  if (zf && zf.hasPacketType === false) {
+    html += '<p class="note" style="margin:8px 16px">No \u2018Packet Type\u2019 column found in ' + esc(state.sel) + '\u2019s file, so all packet types are included, not NDD only.</p>';
+  } else if (zf && zf.skippedNonNdd) {
+    html += '<p class="note" style="margin:8px 16px">Filtered to NDD packets only for ' + esc(state.sel) + ': ' + fmtInt(zf.skippedNonNdd) + ' of ' + fmtInt(zf.rows) + ' rows were a different packet type and left out.</p>';
+  }
 
   html += '<section class="panel" aria-label="' + esc(state.sel) + ' table">';
   html += '<div class="phead"><h2>' + esc(state.sel) + '<span class="meta">' + d.shown.length + ' branch' + (d.shown.length === 1 ? '' : 'es') + ' shown</span></h2>' +
@@ -3157,6 +3255,127 @@ async function downloadFeExcel() {
 }
 
 /* ==========================================================================
+   DAILY SLA / FASR / OFD REPORT  (Summary only — no history, no Excel; each file
+   already covers a full rolling month and fully replaces the one before it)
+   ========================================================================== */
+const SLA_LABELS = ['Date', 'Total AWB', 'SLA', 'FASR PPD (same day)', 'FASR COD (same day)', 'Delivered+VC (Same Day)',
+  'OFD Before 8:30', 'OFD Before 9:30', 'SLA Matured', 'PPD FASR (matured)', 'COD FASR (matured)', 'Delivered+VC (Matured)'];
+const SLA_PCT = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];    // every column except Total AWB (0) and Date
+const SLA_COL_W = [80, 68, 96, 96, 108, 84, 84, 76, 96, 96, 110];
+const slaFile = () => state.files.find(f => f.kind === 'sla' && f.sla);
+function slaScale(vals) {
+  const v = vals.filter(x => x != null).sort((a, b) => a - b);
+  if (v.length < 2) return null;
+  const pos = (v.length - 1) * 0.5, lo = Math.floor(pos), hi = Math.ceil(pos);
+  return { min: v[0], mid: v[lo] + (v[hi] - v[lo]) * (pos - lo), max: v[v.length - 1] };
+}
+function slaFmt(i, v) { return v == null ? '\u2013' : (i === 0 ? fmtInt(v) : fmtPct(v)); }
+function computeSla() {
+  const f = slaFile(); if (!f) return null;
+  const p = f.sla;
+  const rows = p.dates.map(iso => ({ iso, cells: slaMetrics(p.days.get(iso)) }));
+  const total = { cells: slaMetrics(p.grand) };
+  // Total AWB (col 0) is scaled on daily rows only, matching the report's own rule; every % column
+  // is scaled including the Grand Total row.
+  const scales = {};
+  scales[0] = slaScale(rows.map(r => r.cells[0]));
+  SLA_PCT.forEach(c => { scales[c] = slaScale(rows.map(r => r.cells[c]).concat([total.cells[c]])); });
+  return { dates: p.dates, rows, total, scales, allRows: total.cells[0] };
+}
+function slaBg(col, v, scales, isGrand) {
+  if (isGrand && col === 0) return null;   // Grand Total's Total AWB is intentionally left uncoloured
+  return v == null ? null : scaleColorPerf(v, scales[col]);
+}
+function slaTableHTML(d, opts) {
+  opts = opts || {};
+  let h = '<div class="scroller"><table class="grid"><thead><tr>' + SLA_LABELS.map((l, i) => '<th' + (i === 0 ? ' class="nm"' : '') + '>' + esc(l) + '</th>').join('') + '</tr></thead><tbody>';
+  d.rows.forEach(r => {
+    h += '<tr><td class="nm">' + esc(fmtDateLong(r.iso)) + '</td>' +
+      r.cells.map((v, i) => { const bg = slaBg(i, v, d.scales, false); return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + esc(slaFmt(i, v)) + '</td>'; }).join('') + '</tr>';
+  });
+  h += '<tr class="tot"><td class="nm">Grand Total</td>' + d.total.cells.map((v, i) => { const bg = slaBg(i, v, d.scales, true); return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + esc(slaFmt(i, v)) + '</td>'; }).join('') + '</tr>';
+  return h + '</tbody></table></div>';
+}
+function renderSla() {
+  const host = $('#results');
+  const d = computeSla();
+  if (!d) { host.innerHTML = '<div class="panel"><div class="empty"><b>No SLA/FASR/OFD data yet</b>Drop the raw daily CSV/XLSX (it usually covers about a month; the whole file is used).</div></div>'; return; }
+  const anyShare = canShareFiles();
+  let html = '<div class="bar">' +
+    '<button class="btn primary" id="pubBtn" title="Update your shared link with these tables">Publish to link</button>' +
+    '<button class="btn" id="dlSlaImg">Save image</button><button class="btn" id="cpSlaImg">Copy image</button>' +
+    (anyShare ? '<button class="btn" id="shSlaImg">Share&hellip;</button>' : '') +
+    '<span class="sp"></span><label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add date on images</label></div>';
+  html += '<section class="panel" aria-label="Daily SLA / FASR / OFD table"><div class="phead"><h2>Daily SLA / FASR / OFD<span class="meta">' + d.rows.length + ' day' + (d.rows.length === 1 ? '' : 's') + ' &middot; ' + fmtInt(d.allRows) + ' AWB</span></h2></div>' + slaTableHTML(d) + '</section>';
+  host.innerHTML = html;
+  $('#pubBtn').onclick = startPublish;
+  $('#dlSlaImg').onclick = saveSlaImage;
+  $('#cpSlaImg').onclick = copySlaImage;
+  if ($('#shSlaImg')) $('#shSlaImg').onclick = shareSlaImage;
+  $('#optTitle').onchange = e => { state.showTitle = e.target.checked; };
+}
+
+/* ---- image ---- */
+function drawSla(d, withTitle) {
+  const S = 3, pad = 14, rowH = 27, headH = 44;
+  const mc = document.createElement('canvas').getContext('2d'); mc.font = 'bold 13px Arial, Helvetica, sans-serif';
+  let w0 = 96; d.rows.forEach(r => { w0 = Math.max(w0, Math.ceil(mc.measureText(fmtDateLong(r.iso)).width) + 20); });
+  const tableW = w0 + SLA_COL_W.reduce((a, b) => a + b, 0), W = tableW + pad * 2;
+  const H = pad * 2 + (withTitle ? 30 : 0) + headH + rowH * (d.rows.length + 1);
+  const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S;
+  const ctx = cv.getContext('2d'); ctx.scale(S, S);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); ctx.textBaseline = 'middle';
+  const box = (x, y, w, h, fill) => { if (fill) { ctx.fillStyle = fill; ctx.fillRect(x, y, w, h); } ctx.strokeStyle = '#8A9199'; ctx.lineWidth = 1; ctx.strokeRect(x + .5, y + .5, w - 1, h - 1); };
+  let y = pad;
+  if (withTitle) {
+    ctx.fillStyle = '#141D26'; ctx.font = 'bold 18px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left'; ctx.fillText('Daily SLA / FASR / OFD', pad, y + 14);
+    ctx.fillStyle = '#5B6773'; ctx.font = '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'right'; ctx.fillText(stampText(), W - pad, y + 15);
+    y += 30;
+  }
+  let x = pad; ctx.font = 'bold 12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+  box(x, y, w0, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('Date', x + w0 / 2, y + headH / 2 + 1); x += w0;
+  SLA_LABELS.slice(1).forEach((l, i) => {
+    const w = SLA_COL_W[i]; box(x, y, w, headH, '#4472C4'); ctx.fillStyle = '#fff';
+    const lines = wrapLines(ctx, l, w - 8), lh = 12, top = y + headH / 2 - (lines.length * lh) / 2 + lh / 2;
+    lines.forEach((ln, j) => ctx.fillText(ln, x + w / 2, top + j * lh)); x += w;
+  });
+  y += headH;
+  const row = (label, cells, isGrand) => {
+    let xx = pad; ctx.font = (isGrand ? 'bold ' : '') + '14px Arial, Helvetica, sans-serif';
+    box(xx, y, w0, rowH, isGrand ? '#D9E1F2' : null); ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.fillText(label, xx + w0 / 2, y + rowH / 2 + 1); xx += w0;
+    cells.forEach((v, i) => {
+      const w = SLA_COL_W[i], bg = slaBg(i, v, d.scales, isGrand) || (isGrand ? '#D9E1F2' : null);
+      box(xx, y, w, rowH, bg); ctx.fillStyle = '#000'; ctx.font = 'bold 15px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(slaFmt(i, v), xx + w / 2, y + rowH / 2 + 1); xx += w;
+    });
+    y += rowH;
+  };
+  d.rows.forEach(r => row(fmtDateLong(r.iso), r.cells, false));
+  row('Grand Total', d.total.cells, true);
+  return cv;
+}
+function slaBlob() {
+  const d = computeSla(); if (!d) return Promise.reject(new Error('Nothing to draw'));
+  const cv = drawSla(d, state.showTitle);
+  return new Promise((res, rej) => cv.toBlob(b => b ? res(b) : rej(new Error('Image failed')), 'image/png'));
+}
+const slaImgName = () => { const d = computeSla(); return 'SLA_FASR_OFD_' + (d ? d.dates[d.dates.length - 1] : dateSlug()) + '.png'; };
+async function saveSlaImage() { try { saveBlob(await slaBlob(), slaImgName()); toast('Saved ' + slaImgName()); } catch (e) { toast(e.message, true); } }
+async function copySlaImage() {
+  try {
+    if (!(navigator.clipboard && window.ClipboardItem)) throw new Error('Copy is not supported here. Use Save image instead.');
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': slaBlob() })]);
+    toast('Image copied. Paste it into WhatsApp.');
+  } catch (e) { toast(e.message && /supported/.test(e.message) ? e.message : 'Could not copy. Use Save image instead.', true); }
+}
+async function shareSlaImage() {
+  try {
+    const file = new File([await slaBlob()], slaImgName(), { type: 'image/png' });
+    await navigator.share({ files: [file], title: 'Daily SLA / FASR / OFD' });
+  } catch (e) { if (e.name !== 'AbortError') toast('Sharing was not possible. Use Save image instead.', true); }
+}
+
+/* ==========================================================================
    TOP-LEVEL RENDER
    ========================================================================== */
 function render() {
@@ -3164,13 +3383,14 @@ function render() {
   if (state.report === 'ofd') { renderSlots(); renderHint(); renderFix(); renderOfd(); }
   else {
     $('#slots').innerHTML = ''; $('#hint').innerHTML = ''; $('#fix').innerHTML = '';
-    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : state.report === 'dso' ? renderDso() : state.report === 'fe' ? renderFe() : renderDs();
+    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : state.report === 'dso' ? renderDso() : state.report === 'fe' ? renderFe() : state.report === 'sla' ? renderSla() : renderDs();
   }
   const rs = $('#foot-reset');
-  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : state.report === 'fe' ? 'FE Dashboard' : 'DS Performance';
-  rs.innerHTML = '<button class="link" id="pubSettings">Publish settings</button> &nbsp; <button class="link" id="resetChoices">Forget saved ' + which + ' choices</button>' +
+  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : state.report === 'fe' ? 'FE Dashboard' : state.report === 'sla' ? 'SLA/FASR/OFD' : 'DS Performance';
+  const canForget = state.report !== 'sla';
+  rs.innerHTML = '<button class="link" id="pubSettings">Publish settings</button>' + (canForget ? ' &nbsp; <button class="link" id="resetChoices">Forget saved ' + which + ' choices</button>' : '') +
     (storageOK ? '' : ' <span>(this browser is not allowing saved settings)</span>');
-  $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : state.report === 'fe' ? resetFeChoices() : resetDsHistory(); };
+  if (canForget) $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : state.report === 'fe' ? resetFeChoices() : resetDsHistory(); };
   $('#pubSettings').onclick = () => showPubSetup();
 }
 
@@ -3259,7 +3479,8 @@ function buildReportHTML() {
   const haveDso = dsoTabs.length > 0;
   const feTabs = feHasHistory() ? FE_TABS.map(tb => ({ id: tb.id, d: computeFe(tb.id) })).filter(x => x.d && x.d.rows.length) : [];
   const haveFe = feTabs.length > 0;
-  if (!haveOfd && !havePerf && !haveCod && !haveDs && !haveDso && !haveFe) return null;
+  const haveSla = !!slaFile();
+  if (!haveOfd && !havePerf && !haveCod && !haveDs && !haveDso && !haveFe && !haveSla) return null;
 
   const css = ':root{--ink:#141D26;--muted:#5B6773;--rule:#CBD3DB;--accent:#1F4E9E;--hdr:#D9E1F2;--ground:#E9EDF1}' +
     '*{box-sizing:border-box}body{margin:0;background:var(--ground);color:var(--ink);font:15px/1.45 "Bahnschrift","DIN Alternate","Avenir Next","Segoe UI",system-ui,-apple-system,Roboto,sans-serif}' +
@@ -3298,7 +3519,8 @@ function buildReportHTML() {
     cod: codData ? codData.map(x => ({ region: x.region, file: codImgName(x.region), d: x.d })) : null,
     ds: dsData ? { dates: dsDates, file: dsImgName(), zones: dsData } : null,
     dso: haveDso ? dsoTabs.map(x => ({ file: dsoFileName(x.d, 'png'), d: x.d })) : null,
-    fe: haveFe ? feTabs.map(x => ({ file: feFileName(x.d, 'png'), d: x.d })) : null
+    fe: haveFe ? feTabs.map(x => ({ file: feFileName(x.d, 'png'), d: x.d })) : null,
+    sla: haveSla ? { file: slaImgName(), d: computeSla() } : null
   };
 
   const drawSrc = 'const HEADERS=' + JSON.stringify(HEADERS) + ',COL_W=' + JSON.stringify(COL_W) + ',PCT_COLS=' + JSON.stringify(PCT_COLS) +
@@ -3306,10 +3528,11 @@ function buildReportHTML() {
     ',RED=' + JSON.stringify(RED) + ',YEL=' + JSON.stringify(YEL) + ',GRN=' + JSON.stringify(GRN) +
     ',COD_LABELS=' + JSON.stringify(COD_LABELS) + ',COD_GROUPS=' + JSON.stringify(COD_GROUPS) + ',COD_COL_W=' + JSON.stringify(COD_COL_W) +
     ',DS_LABELS=' + JSON.stringify(DS_LABELS) + ',DS_PCT=' + JSON.stringify(DS_PCT) +
-    ',DSO_HEAD=' + JSON.stringify(DSO_HEAD) + ',DSO_PCTV=' + JSON.stringify(DSO_PCTV) + ',DSO_COL_W=' + JSON.stringify(DSO_COL_W) + ';' +
+    ',DSO_HEAD=' + JSON.stringify(DSO_HEAD) + ',DSO_PCTV=' + JSON.stringify(DSO_PCTV) + ',DSO_COL_W=' + JSON.stringify(DSO_COL_W) +
+    ',SLA_LABELS=' + JSON.stringify(SLA_LABELS) + ',SLA_PCT=' + JSON.stringify(SLA_PCT) + ',SLA_COL_W=' + JSON.stringify(SLA_COL_W) + ';' +
     'const MON=' + JSON.stringify(MON) + ';const fmtInt=' + fmtInt + ';const fmtPct=' + fmtPct + ';const fmtDateLong=' + fmtDateLong + ';' +
     'var DATA=' + jsonForScript(runtimeData) + ';const stampText=function(){return DATA.stamp};\n' +
-    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso, feFmt, drawFe].join('\n');
+    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso, feFmt, drawFe, slaScale, slaFmt, slaBg, drawSla].join('\n');
 
   const uiSrc = '(function(){' +
     'var rt=[].slice.call(document.querySelectorAll("[data-rtab]")),rs=[].slice.call(document.querySelectorAll(".rsec"));' +
@@ -3331,6 +3554,8 @@ function buildReportHTML() {
     '[].slice.call(document.querySelectorAll("[data-dimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.dimg;dsoBlobAt(i).then(function(bl){saveAs(bl,DATA.dso[i].file)})}});' +
     'function feBlobAt(i){var c=DATA.fe[i];var cv=drawFe(c.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-feimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.feimg;feBlobAt(i).then(function(bl){saveAs(bl,DATA.fe[i].file)})}});' +
+    'function slaBlobStatic(){var cv=drawSla(DATA.sla.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
+    '[].slice.call(document.querySelectorAll("[data-slaimg]")).forEach(function(b){b.onclick=function(){slaBlobStatic().then(function(bl){saveAs(bl,DATA.sla.file)})}});' +
     '})();';
 
   let body = '<div class="wrap"><h1>Daily reports</h1><p class="up">Updated ' + esc(stampText()) + '</p>';
@@ -3341,6 +3566,7 @@ function buildReportHTML() {
   if (haveDs) rtabs.push(['ds', 'DS Performance']);
   if (haveDso) rtabs.push(['dso', 'DS OFD']);
   if (haveFe) rtabs.push(['fe', 'FE Dashboard']);
+  if (haveSla) rtabs.push(['sla', 'SLA/FASR/OFD']);
   if (rtabs.length > 1) body += '<div class="tabs" role="group" aria-label="Report">' + rtabs.map(([id, n]) => '<button type="button" data-rtab="' + id + '" aria-pressed="false">' + esc(n) + '</button>').join('') + '</div>';
 
   if (haveOfd) {
@@ -3401,6 +3627,10 @@ function buildReportHTML() {
         feTableHTML(x.d, { static: true }) + '</section>';
     });
     body += '</div>';
+  }
+  if (haveSla) {
+    const d = computeSla();
+    body += '<div class="rsec" id="r-sla"' + (rtabs.length > 1 ? ' hidden' : '') + '><section class="panel"><div class="ph"><h2>Daily SLA / FASR / OFD</h2><button type="button" data-slaimg>Save as image</button></div>' + slaTableHTML(d, { static: true }) + '</section></div>';
   }
   body += '</div>';
   return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
