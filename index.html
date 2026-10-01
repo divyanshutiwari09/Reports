@@ -260,7 +260,8 @@ const REPORTS = [
   { id: 'ds',   name: 'DS Performance' },
   { id: 'dso',  name: 'DS OFD' },
   { id: 'fe',   name: 'FE Dashboard' },
-  { id: 'sla',  name: 'SLA/FASR/OFD' }
+  { id: 'sla',  name: 'SLA/FASR/OFD' },
+  { id: 'ofdp', name: 'OFD Done/Report Pending' }
 ];
 
 /* ---- OFD report ---- */
@@ -463,7 +464,7 @@ const deepCopy = o => JSON.parse(JSON.stringify(o));
 function parseOfdRows(rows, head) {
   const idx = {};
   OFD_REQUIRED.forEach(c => { idx[c] = head.indexOf(c.toLowerCase()); });
-  const pktCol = head.indexOf('Service Type');   // optional: when present, only NDD packets are counted
+  const pktCol = head.indexOf('service type');   // optional: when present, only NDD packets are counted
   const branches = new Map();
   let unassigned = 0, total = 0, skippedNonNdd = 0;
   for (let r = 1; r < rows.length; r++) {
@@ -936,6 +937,94 @@ function slaMetrics(a) {
     a.slaOldNum ? a.dvMatNum / a.slaOldNum : null];
 }
 
+/* ---- OFD Done but Report Pending: City -> Centre pivot, one continuous rolling table (no sheet-per-month) ---- */
+const OFDP_REQUIRED = ['CLIENT CODE', 'AWB NO', 'DELIVERY CITY', 'OFD TIME', 'CENTRE NAME', 'FE NAME'];
+const OFDP_KEY = 'ofdp-history-v1';
+const OFDP_CLEAN_DAY = 5;    // once the new month reaches this day-of-month, the previous month's columns are dropped
+const OFDP_WINDOW = 5;       // dates shown on screen and in the image; the Excel export gets everything currently retained
+let ofdpHistory = { days: {} };   // iso -> { cities: { cityKey: { name, centres: { centreKey: { name, n } } } } }
+
+function parseOfdPendRows(rows, head) {
+  const col = n => head.indexOf(n.toLowerCase());
+  const C = { city: col('DELIVERY CITY'), time: col('OFD TIME'), centre: col('CENTRE NAME') };
+  const S = v => (v == null ? '' : String(v).trim());
+  const counts = {};
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    const d = codParseDate(row[C.time]);
+    if (d != null) counts[d] = (counts[d] || 0) + 1;
+  }
+  let reportDateMs = null, best = -1;
+  Object.keys(counts).forEach(k => { const n = Number(k); if (counts[k] > best) { best = counts[k]; reportDateMs = n; } });
+  if (reportDateMs == null) throw new Error('No dates found in OFD TIME.');
+  const cities = new Map();
+  let total = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    if (codParseDate(row[C.time]) !== reportDateMs) continue;
+    const cityName = S(row[C.city]) || '(blank)', centreName = S(row[C.centre]) || '(blank)';
+    const ck = bkey(cityName);
+    let city = cities.get(ck); if (!city) { city = { name: cityName, centres: new Map() }; cities.set(ck, city); }
+    const cek = bkey(centreName);
+    let centre = city.centres.get(cek); if (!centre) { centre = { name: centreName, n: 0 }; city.centres.set(cek, centre); }
+    centre.n++; total++;
+  }
+  return { kind: 'ofdp', date: dsDateSlug(reportDateMs), cities, rows: total };
+}
+
+function loadOfdp() { ofdpHistory = { days: {} }; try { const s = JSON.parse(lsGet(nsKey(OFDP_KEY)) || 'null'); if (s && s.days) ofdpHistory = s; } catch (e) {} }
+function saveOfdpHistory() { lsSet(nsKey(OFDP_KEY), JSON.stringify(ofdpHistory)); }
+function resetOfdpHistory() { lsDel(nsKey(OFDP_KEY)); loadOfdp(); render(); toast('Saved OFD Done/Report Pending data cleared'); }
+function ofdpHasHistory() { return Object.keys(ofdpHistory.days).length > 0; }
+function ofdpAllDays() { return Object.keys(ofdpHistory.days).sort(); }
+function ofdpLastDays(n) { return ofdpAllDays().slice(-n); }
+const ofdpFile = () => state.files.find(f => f.kind === 'ofdp' && f.ofdp);
+function ofdpCleanupOldMonth(latestDate) {
+  const d = new Date(latestDate + 'T00:00:00Z');
+  if (d.getUTCDate() < OFDP_CLEAN_DAY) return;
+  const curYM = monthOf(latestDate);
+  let removed = 0;
+  Object.keys(ofdpHistory.days).forEach(dt => { if (monthOf(dt) < curYM) { delete ofdpHistory.days[dt]; removed++; } });
+  if (removed) { saveOfdpHistory(); toast('Cleared last month\u2019s OFD Done/Report Pending columns (past the ' + OFDP_CLEAN_DAY + 'th of the new month).'); }
+}
+function applyOfdpFile() {
+  const f = ofdpFile(); if (!f || !f.ofdp.date) return;
+  const p = f.ofdp, cities = {};
+  p.cities.forEach((c, ck) => { const centres = {}; c.centres.forEach((ce, cek) => { centres[cek] = { name: ce.name, n: ce.n }; }); cities[ck] = { name: c.name, centres }; });
+  ofdpHistory.days[p.date] = { cities };
+  saveOfdpHistory();
+  ofdpCleanupOldMonth(p.date);
+}
+
+function ofdpPct(latest, prev) { return (!prev || latest == null) ? 0 : latest / prev; }   // #DIV/0! and #N/A both become 0, as asked
+function computeOfdp(dates) {
+  // the row roster (which cities/centres appear at all) is drawn from every day still retained, not just
+  // the dates being displayed, so a hub with no recent activity doesn't vanish from the table
+  const roster = new Map();   // cityKey -> { name, centres: Map(centreKey -> name) }
+  ofdpAllDays().forEach(iso => {
+    const day = ofdpHistory.days[iso];
+    Object.keys(day.cities).forEach(ck => {
+      const c = day.cities[ck];
+      let city = roster.get(ck); if (!city) { city = { name: c.name, centres: new Map() }; roster.set(ck, city); }
+      Object.keys(c.centres).forEach(cek => { if (!city.centres.has(cek)) city.centres.set(cek, c.centres[cek].name); });
+    });
+  });
+  const valFor = (ck, cek, iso) => { const day = ofdpHistory.days[iso]; const c = day && day.cities[ck]; const ce = c && c.centres[cek]; return ce ? ce.n : 0; };
+  const cityValFor = (ck, iso) => { const day = ofdpHistory.days[iso]; const c = day && day.cities[ck]; if (!c) return 0; return Object.keys(c.centres).reduce((s, k) => s + c.centres[k].n, 0); };
+  const cityKeys = Array.from(roster.keys()).sort((a, b) => roster.get(a).name.localeCompare(roster.get(b).name));
+  const rows = [];
+  cityKeys.forEach(ck => {
+    const city = roster.get(ck), cVals = dates.map(d => cityValFor(ck, d));
+    rows.push({ key: ck, name: city.name, indent: false, vals: cVals, pct: ofdpPct(cVals[cVals.length - 1], cVals[cVals.length - 2]) });
+    const centreKeys = Array.from(city.centres.keys()).sort((a, b) => city.centres.get(a).localeCompare(city.centres.get(b)));
+    centreKeys.forEach(cek => {
+      const vals = dates.map(d => valFor(ck, cek, d));
+      rows.push({ key: ck + '|' + cek, name: city.centres.get(cek), indent: true, vals, pct: ofdpPct(vals[vals.length - 1], vals[vals.length - 2]) });
+    });
+  });
+  return { dates, rows };
+}
+
 function parseAny(buf, name) {
   const names = XLSX.read(buf, { type: 'array', bookSheets: true }).SheetNames;
   if (names.indexOf('Sheet1') >= 0 && names.indexOf('Sheet2') >= 0) {
@@ -954,7 +1043,7 @@ function parseAny(buf, name) {
   if (!rows.length) throw new Error('The sheet is empty.');
   const head = rows[0].map(h => String(h == null ? '' : h).trim().toLowerCase());
   const missing = list => list.filter(c => head.indexOf(c.toLowerCase()) < 0);
-  const mc = missing(COD_NEEDED), mp = missing(PERF_REQUIRED), mo = missing(OFD_REQUIRED), md = missing(DS_REQUIRED), mf = missing(FE_REQUIRED), ms = missing(SLA_REQUIRED);
+  const mc = missing(COD_NEEDED), mp = missing(PERF_REQUIRED), mo = missing(OFD_REQUIRED), md = missing(DS_REQUIRED), mf = missing(FE_REQUIRED), ms = missing(SLA_REQUIRED), mop = missing(OFDP_REQUIRED);
   if (!mc.length) return parseCodRows(rows, head);
   if (!mp.length) return parsePerfRows(rows, head);
   if (!mo.length) return parseOfdRows(rows, head);
@@ -965,8 +1054,9 @@ function parseAny(buf, name) {
   }
   if (!mf.length) return parseFeRows(rows, head);
   if (!ms.length) return parseSlaRows(rows, head);
-  const opts = [{ n: 'COD Pendency', m: mc }, { n: 'Daily performance', m: mp }, { n: 'OFD', m: mo }, { n: 'DS Performance', m: md }, { n: 'FE Dashboard', m: mf }, { n: 'SLA/FASR/OFD', m: ms }].sort((a, b) => a.m.length - b.m.length);
-  throw new Error('Not recognised as an OFD, Daily performance, COD Pendency, DS Performance, FE Dashboard or SLA/FASR/OFD file. Closest match is ' + opts[0].n + ', missing: ' + opts[0].m.join(', '));
+  if (!mop.length) return parseOfdPendRows(rows, head);
+  const opts = [{ n: 'COD Pendency', m: mc }, { n: 'Daily performance', m: mp }, { n: 'OFD', m: mo }, { n: 'DS Performance', m: md }, { n: 'FE Dashboard', m: mf }, { n: 'SLA/FASR/OFD', m: ms }, { n: 'OFD Done/Report Pending', m: mop }].sort((a, b) => a.m.length - b.m.length);
+  throw new Error('Not recognised as an OFD, Daily performance, COD Pendency, DS Performance, FE Dashboard, SLA/FASR/OFD or OFD Done/Report Pending file. Closest match is ' + opts[0].n + ', missing: ' + opts[0].m.join(', '));
 }
 
 /* ---- background workers ---- */
@@ -977,11 +1067,11 @@ function getWorkerURL() {
   const lib = document.getElementById('xlsx-src').textContent;
   const code = lib + '\n;const OFD_REQUIRED=' + JSON.stringify(OFD_REQUIRED) + ',PERF_REQUIRED=' + JSON.stringify(PERF_REQUIRED) +
     ',PERF_DROP=' + JSON.stringify(PERF_DROP) + ',COD_REQUIRED=' + JSON.stringify(COD_REQUIRED) + ',COD_NEEDED=' + JSON.stringify(COD_NEEDED) +
-    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) + ',SLA_REQUIRED=' + JSON.stringify(SLA_REQUIRED) +
+    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) + ',SLA_REQUIRED=' + JSON.stringify(SLA_REQUIRED) + ',OFDP_REQUIRED=' + JSON.stringify(OFDP_REQUIRED) +
     ';const bkey=' + bkey + ';const isY=' + isY + ';\n' +
     parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
     dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + feSame + '\n' + parseFeRows + '\n' + parseFeDash +
-    '\n' + slaParseTS + '\n' + slaDateOnly + '\n' + slaSecOfDay + '\n' + slaDateSlug + '\n' + slaBlank + '\n' + parseSlaRows + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
+    '\n' + slaParseTS + '\n' + slaDateOnly + '\n' + slaSecOfDay + '\n' + slaDateSlug + '\n' + slaBlank + '\n' + parseSlaRows + '\n' + parseOfdPendRows + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
     'self.onmessage=function(e){try{self.postMessage({ok:true,p:parseAny(e.data.buf,e.data.name)});}catch(err){self.postMessage({ok:false,msg:String((err&&err.message)||err)});}};';
   workerURL = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   return workerURL;
@@ -1069,6 +1159,11 @@ async function processOne(f, rec) {
       state.files.filter(x => x !== rec && x.kind === 'sla').forEach(x => { state.files = state.files.filter(y => y !== x); });
       rec.sla = p; rec.rows = p.rows;
       if (!state.picked) state.report = 'sla';
+    } else if (p.kind === 'ofdp') {
+      rec.ofdp = p; rec.rows = p.rows;
+      applyOfdpFile();
+      toast(f.name + ': added ' + fmtDateLong(p.date) + ' to OFD Done/Report Pending.');
+      if (!state.picked) state.report = 'ofdp';
     } else if (p.kind === 'fe') {
       rec.rows = p.rows; applyFeRaw(p);
       toast(f.name + ': added ' + fmtDateLong(p.date) + ' to FE Dashboard history.');
@@ -1123,7 +1218,7 @@ async function addFiles(fileList) {
   render();
 }
 
-const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : id === 'fe' ? feHasHistory() : id === 'sla' ? !!slaFile() : false;
+const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : id === 'fe' ? feHasHistory() : id === 'sla' ? !!slaFile() : id === 'ofdp' ? ofdpHasHistory() : false;
 
 
 /* ==========================================================================
@@ -1238,9 +1333,9 @@ function renderOfd() {
     '<label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add zone name and date on images</label>' +
     '</div>';
   if (zf && zf.hasPacketType === false) {
-    html += '<p class="note" style="margin:8px 16px">No \u2018Packet Type\u2019 column found in ' + esc(state.sel) + '\u2019s file, so all packet types are included, not NDD only.</p>';
+    html += '<p class="note" style="margin:8px 16px">No \u2018Service Type\u2019 column found in ' + esc(state.sel) + '\u2019s file, so all service types are included, not NDD only.</p>';
   } else if (zf && zf.skippedNonNdd) {
-    html += '<p class="note" style="margin:8px 16px">Filtered to NDD packets only for ' + esc(state.sel) + ': ' + fmtInt(zf.skippedNonNdd) + ' of ' + fmtInt(zf.rows) + ' rows were a different packet type and left out.</p>';
+    html += '<p class="note" style="margin:8px 16px">Filtered to NDD packets only for ' + esc(state.sel) + ': ' + fmtInt(zf.skippedNonNdd) + ' of ' + fmtInt(zf.rows) + ' rows were a different service type and left out.</p>';
   }
 
   html += '<section class="panel" aria-label="' + esc(state.sel) + ' table">';
@@ -3376,6 +3471,122 @@ async function shareSlaImage() {
 }
 
 /* ==========================================================================
+   OFD DONE, REPORT PENDING
+   ========================================================================== */
+/* ---- screen ---- */
+function ofdpTableHTML(d) {
+  let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm">HUB</th>' +
+    d.dates.map(iso => '<th>' + esc(fmtDateLong(iso)) + '</th>').join('') + '<th>% CHANGE</th></tr></thead><tbody>';
+  d.rows.forEach(r => {
+    h += '<tr' + (r.indent ? '' : ' style="font-weight:700;background:#F2F2F2"') + '><td class="nm">' + (r.indent ? '&nbsp;&nbsp;' : '') + esc(r.name) + '</td>' +
+      r.vals.map(v => '<td>' + fmtInt(v) + '</td>').join('') +
+      '<td style="background:' + (scaleColorPerf(r.pct, { min: 0, mid: 1, max: 2 }) || '') + '">' + fmtPct(r.pct) + '</td></tr>';
+  });
+  return h + '</tbody></table></div>';
+}
+function renderOfdp() {
+  const host = $('#results');
+  if (!ofdpHasHistory()) { host.innerHTML = '<div class="panel"><div class="empty"><b>No OFD Done/Report Pending data yet</b>Drop the raw file (one row per pending AWB, for yesterday\u2019s OFD packets).</div></div>'; return; }
+  const dates = ofdpLastDays(OFDP_WINDOW), d = computeOfdp(dates), anyShare = canShareFiles();
+  let html = '<div class="bar">' +
+    '<button class="btn primary" id="pubBtn" title="Update your shared link with these tables">Publish to link</button>' +
+    '<button class="btn" id="dlOfdpImg">Save image</button><button class="btn" id="cpOfdpImg">Copy image</button>' +
+    (anyShare ? '<button class="btn" id="shOfdpImg">Share&hellip;</button>' : '') +
+    '<button class="btn" id="dlOfdpXls">Download Excel</button>' +
+    '<button class="link" id="clrOfdp">Clear saved data</button><span class="sp"></span>' +
+    '<label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add date on images</label></div>';
+  html += '<section class="panel" aria-label="OFD Done / Report Pending table"><div class="phead"><h2>OFD Done, Report Pending<span class="meta">Last ' + dates.length + ' day' + (dates.length === 1 ? '' : 's') + '</span></h2></div>' + ofdpTableHTML(d) + '</section>';
+  host.innerHTML = html;
+  $('#pubBtn').onclick = startPublish;
+  $('#dlOfdpImg').onclick = saveOfdpImage;
+  $('#cpOfdpImg').onclick = copyOfdpImage;
+  if ($('#shOfdpImg')) $('#shOfdpImg').onclick = shareOfdpImage;
+  $('#dlOfdpXls').onclick = downloadOfdpExcel;
+  $('#clrOfdp').onclick = () => { if (window.confirm('Remove all saved OFD Done/Report Pending days from this browser?')) resetOfdpHistory(); };
+  $('#optTitle').onchange = e => { state.showTitle = e.target.checked; };
+}
+
+/* ---- image ---- */
+function drawOfdp(d, withTitle) {
+  const S = 3, pad = 14, rowH = 26, headH = 38, colW = 78, pctW = 84;
+  const mc = document.createElement('canvas').getContext('2d'); mc.font = 'bold 13px Arial, Helvetica, sans-serif';
+  let w0 = 130; d.rows.forEach(r => { w0 = Math.max(w0, Math.ceil(mc.measureText((r.indent ? '  ' : '') + r.name).width) + 24); });
+  const tableW = w0 + colW * d.dates.length + pctW, W = tableW + pad * 2;
+  const H = pad * 2 + (withTitle ? 30 : 0) + headH + rowH * d.rows.length;
+  const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S;
+  const ctx = cv.getContext('2d'); ctx.scale(S, S);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); ctx.textBaseline = 'middle';
+  const box = (x, y, w, h, fill) => { if (fill) { ctx.fillStyle = fill; ctx.fillRect(x, y, w, h); } ctx.strokeStyle = '#8A9199'; ctx.lineWidth = 1; ctx.strokeRect(x + .5, y + .5, w - 1, h - 1); };
+  let y = pad;
+  if (withTitle) {
+    ctx.fillStyle = '#141D26'; ctx.font = 'bold 18px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left'; ctx.fillText('OFD Done, Report Pending', pad, y + 14);
+    ctx.fillStyle = '#5B6773'; ctx.font = '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'right'; ctx.fillText(stampText(), W - pad, y + 15);
+    y += 30;
+  }
+  let x = pad; ctx.font = 'bold 12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+  box(x, y, w0, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('HUB', x + w0 / 2, y + headH / 2 + 1); x += w0;
+  d.dates.forEach(iso => { box(x, y, colW, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText(fmtDateLong(iso), x + colW / 2, y + headH / 2 + 1); x += colW; });
+  box(x, y, pctW, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('% CHANGE', x + pctW / 2, y + headH / 2 + 1);
+  y += headH;
+  d.rows.forEach(r => {
+    let xx = pad; const bold = !r.indent, fill = bold ? '#F2F2F2' : null;
+    ctx.font = (bold ? 'bold ' : '') + '13px Arial, Helvetica, sans-serif';
+    box(xx, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.textAlign = 'left'; ctx.fillText((r.indent ? '   ' : '') + r.name, xx + 7, y + rowH / 2 + 1); xx += w0;
+    r.vals.forEach(v => { box(xx, y, colW, rowH, fill); ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.fillText(fmtInt(v), xx + colW / 2, y + rowH / 2 + 1); xx += colW; });
+    const bg = scaleColorPerf(r.pct, { min: 0, mid: 1, max: 2 });
+    box(xx, y, pctW, rowH, bg || fill); ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.fillText(fmtPct(r.pct), xx + pctW / 2, y + rowH / 2 + 1);
+    y += rowH;
+  });
+  return cv;
+}
+function ofdpBlob() {
+  const d = computeOfdp(ofdpLastDays(OFDP_WINDOW));
+  return new Promise((res, rej) => drawOfdp(d, state.showTitle).toBlob(b => b ? res(b) : rej(new Error('Image failed')), 'image/png'));
+}
+const ofdpImgName = () => 'OFD_Done_Report_Pending_' + (ofdpAllDays().slice(-1)[0] || dateSlug()) + '.png';
+async function saveOfdpImage() { try { saveBlob(await ofdpBlob(), ofdpImgName()); toast('Saved ' + ofdpImgName()); } catch (e) { toast(e.message, true); } }
+async function copyOfdpImage() {
+  try {
+    if (!(navigator.clipboard && window.ClipboardItem)) throw new Error('Copy is not supported here. Use Save image instead.');
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': ofdpBlob() })]);
+    toast('Image copied. Paste it into WhatsApp.');
+  } catch (e) { toast(e.message && /supported/.test(e.message) ? e.message : 'Could not copy. Use Save image instead.', true); }
+}
+async function shareOfdpImage() {
+  try { const file = new File([await ofdpBlob()], ofdpImgName(), { type: 'image/png' }); await navigator.share({ files: [file], title: 'OFD Done, Report Pending' }); }
+  catch (e) { if (e.name !== 'AbortError') toast('Sharing was not possible. Use Save image instead.', true); }
+}
+
+/* ---- Excel: every retained date, one continuous sheet ---- */
+async function downloadOfdpExcel() {
+  if (!ofdpHasHistory()) return;
+  try {
+    const dates = ofdpAllDays(), d = computeOfdp(dates);
+    const wb = new ExcelJS.Workbook(); wb.created = new Date();
+    const ws = wb.addWorksheet('OFD Done Report Pending');
+    ws.getColumn(1).width = 30;
+    ws.getCell(1, 1).value = 'HUB'; ws.getCell(1, 1).font = { bold: true };
+    dates.forEach((iso, i) => { const p = iso.split('-'), c = ws.getCell(1, i + 2); c.value = new Date(Date.UTC(+p[0], +p[1] - 1, +p[2])); c.numFmt = 'yyyy-mm-dd'; c.font = { bold: true }; ws.getColumn(i + 2).width = 9; });
+    const pctCol = dates.length + 2;
+    ws.getCell(1, pctCol).value = '% CHANGE'; ws.getCell(1, pctCol).font = { bold: true }; ws.getColumn(pctCol).width = 11;
+    d.rows.forEach((r, i) => {
+      const rr = i + 2;
+      const nm = ws.getCell(rr, 1); nm.value = (r.indent ? '   ' : '') + r.name; if (!r.indent) { nm.font = { bold: true }; ws.getRow(rr).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } }; }
+      r.vals.forEach((v, j) => { const c = ws.getCell(rr, j + 2); c.value = v; if (!r.indent) c.font = { bold: true }; });
+      const pc = ws.getCell(rr, pctCol); pc.value = r.pct; pc.numFmt = '0%'; if (!r.indent) pc.font = { bold: true };
+    });
+    if (d.rows.length) {
+      const L = openpyxlCol(pctCol);
+      ws.addConditionalFormatting({ ref: L + '2:' + L + (d.rows.length + 1), rules: [{ type: 'colorScale', priority: 1, cfvo: [{ type: 'min' }, { type: 'percentile', value: 50 }, { type: 'max' }], color: [{ argb: 'FFF8696B' }, { argb: 'FFFFEB84' }, { argb: 'FF63BE7B' }] }] });
+    }
+    const name = 'OFD_Done_Report_Pending_' + (dates[dates.length - 1] || dateSlug()) + '.xlsx';
+    saveBlob(new Blob([await wb.xlsx.writeBuffer()], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), name);
+    toast('Saved ' + name);
+  } catch (e) { console.error(e); toast('Excel could not be created: ' + e.message, true); }
+}
+
+
+/* ==========================================================================
    TOP-LEVEL RENDER
    ========================================================================== */
 function render() {
@@ -3383,11 +3594,11 @@ function render() {
   if (state.report === 'ofd') { renderSlots(); renderHint(); renderFix(); renderOfd(); }
   else {
     $('#slots').innerHTML = ''; $('#hint').innerHTML = ''; $('#fix').innerHTML = '';
-    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : state.report === 'dso' ? renderDso() : state.report === 'fe' ? renderFe() : state.report === 'sla' ? renderSla() : renderDs();
+    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : state.report === 'dso' ? renderDso() : state.report === 'fe' ? renderFe() : state.report === 'sla' ? renderSla() : state.report === 'ofdp' ? renderOfdp() : renderDs();
   }
   const rs = $('#foot-reset');
-  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : state.report === 'fe' ? 'FE Dashboard' : state.report === 'sla' ? 'SLA/FASR/OFD' : 'DS Performance';
-  const canForget = state.report !== 'sla';
+  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : state.report === 'fe' ? 'FE Dashboard' : state.report === 'sla' ? 'SLA/FASR/OFD' : state.report === 'ofdp' ? 'OFD Done/Report Pending' : 'DS Performance';
+  const canForget = state.report !== 'sla' && state.report !== 'ofdp';
   rs.innerHTML = '<button class="link" id="pubSettings">Publish settings</button>' + (canForget ? ' &nbsp; <button class="link" id="resetChoices">Forget saved ' + which + ' choices</button>' : '') +
     (storageOK ? '' : ' <span>(this browser is not allowing saved settings)</span>');
   if (canForget) $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : state.report === 'fe' ? resetFeChoices() : resetDsHistory(); };
@@ -3480,7 +3691,8 @@ function buildReportHTML() {
   const feTabs = feHasHistory() ? FE_TABS.map(tb => ({ id: tb.id, d: computeFe(tb.id) })).filter(x => x.d && x.d.rows.length) : [];
   const haveFe = feTabs.length > 0;
   const haveSla = !!slaFile();
-  if (!haveOfd && !havePerf && !haveCod && !haveDs && !haveDso && !haveFe && !haveSla) return null;
+  const haveOfdp = ofdpHasHistory();
+  if (!haveOfd && !havePerf && !haveCod && !haveDs && !haveDso && !haveFe && !haveSla && !haveOfdp) return null;
 
   const css = ':root{--ink:#141D26;--muted:#5B6773;--rule:#CBD3DB;--accent:#1F4E9E;--hdr:#D9E1F2;--ground:#E9EDF1}' +
     '*{box-sizing:border-box}body{margin:0;background:var(--ground);color:var(--ink);font:15px/1.45 "Bahnschrift","DIN Alternate","Avenir Next","Segoe UI",system-ui,-apple-system,Roboto,sans-serif}' +
@@ -3520,7 +3732,8 @@ function buildReportHTML() {
     ds: dsData ? { dates: dsDates, file: dsImgName(), zones: dsData } : null,
     dso: haveDso ? dsoTabs.map(x => ({ file: dsoFileName(x.d, 'png'), d: x.d })) : null,
     fe: haveFe ? feTabs.map(x => ({ file: feFileName(x.d, 'png'), d: x.d })) : null,
-    sla: haveSla ? { file: slaImgName(), d: computeSla() } : null
+    sla: haveSla ? { file: slaImgName(), d: computeSla() } : null,
+    ofdp: haveOfdp ? { file: ofdpImgName(), d: computeOfdp(ofdpLastDays(OFDP_WINDOW)) } : null
   };
 
   const drawSrc = 'const HEADERS=' + JSON.stringify(HEADERS) + ',COL_W=' + JSON.stringify(COL_W) + ',PCT_COLS=' + JSON.stringify(PCT_COLS) +
@@ -3532,7 +3745,7 @@ function buildReportHTML() {
     ',SLA_LABELS=' + JSON.stringify(SLA_LABELS) + ',SLA_PCT=' + JSON.stringify(SLA_PCT) + ',SLA_COL_W=' + JSON.stringify(SLA_COL_W) + ';' +
     'const MON=' + JSON.stringify(MON) + ';const fmtInt=' + fmtInt + ';const fmtPct=' + fmtPct + ';const fmtDateLong=' + fmtDateLong + ';' +
     'var DATA=' + jsonForScript(runtimeData) + ';const stampText=function(){return DATA.stamp};\n' +
-    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso, feFmt, drawFe, slaScale, slaFmt, slaBg, drawSla].join('\n');
+    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso, feFmt, drawFe, slaScale, slaFmt, slaBg, drawSla, ofdpPct, drawOfdp].join('\n');
 
   const uiSrc = '(function(){' +
     'var rt=[].slice.call(document.querySelectorAll("[data-rtab]")),rs=[].slice.call(document.querySelectorAll(".rsec"));' +
@@ -3556,6 +3769,8 @@ function buildReportHTML() {
     '[].slice.call(document.querySelectorAll("[data-feimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.feimg;feBlobAt(i).then(function(bl){saveAs(bl,DATA.fe[i].file)})}});' +
     'function slaBlobStatic(){var cv=drawSla(DATA.sla.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-slaimg]")).forEach(function(b){b.onclick=function(){slaBlobStatic().then(function(bl){saveAs(bl,DATA.sla.file)})}});' +
+    'function ofdpBlobStatic(){var cv=drawOfdp(DATA.ofdp.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
+    '[].slice.call(document.querySelectorAll("[data-ofdpimg]")).forEach(function(b){b.onclick=function(){ofdpBlobStatic().then(function(bl){saveAs(bl,DATA.ofdp.file)})}});' +
     '})();';
 
   let body = '<div class="wrap"><h1>Daily reports</h1><p class="up">Updated ' + esc(stampText()) + '</p>';
@@ -3567,6 +3782,7 @@ function buildReportHTML() {
   if (haveDso) rtabs.push(['dso', 'DS OFD']);
   if (haveFe) rtabs.push(['fe', 'FE Dashboard']);
   if (haveSla) rtabs.push(['sla', 'SLA/FASR/OFD']);
+  if (haveOfdp) rtabs.push(['ofdp', 'OFD Done/Report Pending']);
   if (rtabs.length > 1) body += '<div class="tabs" role="group" aria-label="Report">' + rtabs.map(([id, n]) => '<button type="button" data-rtab="' + id + '" aria-pressed="false">' + esc(n) + '</button>').join('') + '</div>';
 
   if (haveOfd) {
@@ -3631,6 +3847,10 @@ function buildReportHTML() {
   if (haveSla) {
     const d = computeSla();
     body += '<div class="rsec" id="r-sla"' + (rtabs.length > 1 ? ' hidden' : '') + '><section class="panel"><div class="ph"><h2>Daily SLA / FASR / OFD</h2><button type="button" data-slaimg>Save as image</button></div>' + slaTableHTML(d, { static: true }) + '</section></div>';
+  }
+  if (haveOfdp) {
+    const d = computeOfdp(ofdpLastDays(OFDP_WINDOW));
+    body += '<div class="rsec" id="r-ofdp"' + (rtabs.length > 1 ? ' hidden' : '') + '><section class="panel"><div class="ph"><h2>OFD Done, Report Pending</h2><button type="button" data-ofdpimg>Save as image</button></div>' + ofdpTableHTML(d) + '</section></div>';
   }
   body += '</div>';
   return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
@@ -3794,6 +4014,7 @@ loadCod();
 loadDs();
 loadDso();
 loadFe();
+loadOfdp();
 loadPub();
 render();
 </script>
