@@ -996,6 +996,15 @@ function applyOfdpFile() {
   ofdpCleanupOldMonth(p.date);
 }
 
+const OFDP_CH_KEY = 'ofdp-choices-v1';
+let ofdpChoices = {};   // 'cityKey' -> 'out', or 'cityKey|centreKey' -> 'out'  (anything not listed is shown)
+function loadOfdpChoices() { ofdpChoices = {}; try { const s = JSON.parse(lsGet(nsKey(OFDP_CH_KEY)) || 'null'); if (s) ofdpChoices = s; } catch (e) {} }
+function saveOfdpChoices() { lsSet(nsKey(OFDP_CH_KEY), JSON.stringify(ofdpChoices)); }
+function resetOfdpChoices() { lsDel(nsKey(OFDP_CH_KEY)); loadOfdpChoices(); render(); toast('Saved OFD Done/Report Pending hub choices cleared'); }
+function ofdpSetChoice(key, val) { if (val === 'in') delete ofdpChoices[key]; else ofdpChoices[key] = val; saveOfdpChoices(); render(); }
+const ofdpCityIn = ck => ofdpChoices[ck] !== 'out';
+const ofdpCentreIn = (ck, cek) => ofdpChoices[ck + '|' + cek] !== 'out';
+
 function ofdpPct(latest, prev) { return (!prev || latest == null) ? 0 : latest / prev; }   // #DIV/0! and #N/A both become 0, as asked
 function computeOfdp(dates) {
   // the row roster (which cities/centres appear at all) is drawn from every day still retained, not just
@@ -1010,36 +1019,66 @@ function computeOfdp(dates) {
     });
   });
   const valFor = (ck, cek, iso) => { const day = ofdpHistory.days[iso]; const c = day && day.cities[ck]; const ce = c && c.centres[cek]; return ce ? ce.n : 0; };
-  const cityValFor = (ck, iso) => { const day = ofdpHistory.days[iso]; const c = day && day.cities[ck]; if (!c) return 0; return Object.keys(c.centres).reduce((s, k) => s + c.centres[k].n, 0); };
+  // a city's total only sums the centres currently kept in, so leaving a hub out actually changes the city row too
+  const cityValFor = (ck, centreKeys, iso) => centreKeys.reduce((s, cek) => s + valFor(ck, cek, iso), 0);
   const cityKeys = Array.from(roster.keys()).sort((a, b) => roster.get(a).name.localeCompare(roster.get(b).name));
-  const rows = [];
+  const rows = [], hidden = [];
   cityKeys.forEach(ck => {
-    const city = roster.get(ck), cVals = dates.map(d => cityValFor(ck, d));
+    const city = roster.get(ck);
+    const allCentreKeys = Array.from(city.centres.keys()).sort((a, b) => city.centres.get(a).localeCompare(city.centres.get(b)));
+    if (!ofdpCityIn(ck)) { hidden.push({ key: ck, name: city.name, level: 'city' }); return; }
+    const shownCentreKeys = allCentreKeys.filter(cek => ofdpCentreIn(ck, cek));
+    const cVals = dates.map(d => cityValFor(ck, shownCentreKeys, d));
     rows.push({ key: ck, name: city.name, indent: false, vals: cVals, pct: ofdpPct(cVals[cVals.length - 1], cVals[cVals.length - 2]) });
-    const centreKeys = Array.from(city.centres.keys()).sort((a, b) => city.centres.get(a).localeCompare(city.centres.get(b)));
-    centreKeys.forEach(cek => {
+    allCentreKeys.forEach(cek => {
+      if (!ofdpCentreIn(ck, cek)) { hidden.push({ key: ck + '|' + cek, name: city.centres.get(cek) + ' (' + city.name + ')', level: 'centre' }); return; }
       const vals = dates.map(d => valFor(ck, cek, d));
       rows.push({ key: ck + '|' + cek, name: city.centres.get(cek), indent: true, vals, pct: ofdpPct(vals[vals.length - 1], vals[vals.length - 2]) });
     });
   });
-  return { dates, rows };
+  return { dates, rows, hidden };
 }
 
-function parseAny(buf, name) {
-  const names = XLSX.read(buf, { type: 'array', bookSheets: true }).SheetNames;
-  if (names.indexOf('Sheet1') >= 0 && names.indexOf('Sheet2') >= 0) {
-    const wbTest = XLSX.read(buf, { type: 'array', dense: true, cellDates: true, sheets: 'Sheet1', cellStyles: false, cellNF: false, cellText: false, cellHTML: false });
-    const r1 = wbTest.Sheets['Sheet1'] ? XLSX.utils.sheet_to_json(wbTest.Sheets['Sheet1'], { header: 1, raw: true, defval: null }) : null;
-    const a2 = r1 && r1[1] && r1[1][0] != null ? String(r1[1][0]).trim().toLowerCase() : '';
-    if (a2 === 'hub') return parseFeDash(buf);
+function csvToRows(text) {
+  // our own minimal CSV reader. SheetJS's CSV parser auto-sniffs date-looking text into Excel serials
+  // using its own (not necessarily day-first) guess, even with cellDates off, so for CSV files we bypass
+  // it entirely and keep every cell as the exact plain string it is -- our own parsers below already
+  // handle plain day-first text correctly.
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);   // strip a BOM if present
+  const rows = []; let row = [], field = '', inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) { if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; } else field += c; }
+    else if (c === '"') inQ = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\r') { /* skip */ }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else field += c;
   }
-
-  const pick = names.indexOf('Detail') >= 0 ? 'Detail' : (names.indexOf('Sheet1') >= 0 ? 'Sheet1' : names[0]);
-  if (!pick) throw new Error('No sheet found in this file.');
-  const wb = XLSX.read(buf, { type: 'array', dense: true, cellDates: true, sheets: pick, cellStyles: false, cellNF: false, cellText: false, cellHTML: false });
-  const ws = wb.Sheets[pick];
-  if (!ws) throw new Error('No sheet found in this file.');
-  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+function parseAny(buf, name) {
+  const isCsv = /\.csv$/i.test(name || '');
+  let rows;
+  if (isCsv) {
+    let text; try { text = new TextDecoder('utf-8').decode(new Uint8Array(buf)); } catch (e) { text = ''; }
+    rows = csvToRows(text);
+  } else {
+    const names = XLSX.read(buf, { type: 'array', bookSheets: true }).SheetNames;
+    if (names.indexOf('Sheet1') >= 0 && names.indexOf('Sheet2') >= 0) {
+      const wbTest = XLSX.read(buf, { type: 'array', dense: true, cellDates: true, sheets: 'Sheet1', cellStyles: false, cellNF: false, cellText: false, cellHTML: false });
+      const r1 = wbTest.Sheets['Sheet1'] ? XLSX.utils.sheet_to_json(wbTest.Sheets['Sheet1'], { header: 1, raw: true, defval: null }) : null;
+      const a2 = r1 && r1[1] && r1[1][0] != null ? String(r1[1][0]).trim().toLowerCase() : '';
+      if (a2 === 'hub') return parseFeDash(buf);
+    }
+    const pick = names.indexOf('Detail') >= 0 ? 'Detail' : (names.indexOf('Sheet1') >= 0 ? 'Sheet1' : names[0]);
+    if (!pick) throw new Error('No sheet found in this file.');
+    const wb = XLSX.read(buf, { type: 'array', dense: true, cellDates: true, sheets: pick, cellStyles: false, cellNF: false, cellText: false, cellHTML: false });
+    const ws = wb.Sheets[pick];
+    if (!ws) throw new Error('No sheet found in this file.');
+    rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+  }
   if (!rows.length) throw new Error('The sheet is empty.');
   const head = rows[0].map(h => String(h == null ? '' : h).trim().toLowerCase());
   const missing = list => list.filter(c => head.indexOf(c.toLowerCase()) < 0);
@@ -1069,7 +1108,7 @@ function getWorkerURL() {
     ',PERF_DROP=' + JSON.stringify(PERF_DROP) + ',COD_REQUIRED=' + JSON.stringify(COD_REQUIRED) + ',COD_NEEDED=' + JSON.stringify(COD_NEEDED) +
     ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) + ',SLA_REQUIRED=' + JSON.stringify(SLA_REQUIRED) + ',OFDP_REQUIRED=' + JSON.stringify(OFDP_REQUIRED) +
     ';const bkey=' + bkey + ';const isY=' + isY + ';\n' +
-    parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
+    csvToRows + '\n' + parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
     dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + feSame + '\n' + parseFeRows + '\n' + parseFeDash +
     '\n' + slaParseTS + '\n' + slaDateOnly + '\n' + slaSecOfDay + '\n' + slaDateSlug + '\n' + slaBlank + '\n' + parseSlaRows + '\n' + parseOfdPendRows + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
     'self.onmessage=function(e){try{self.postMessage({ok:true,p:parseAny(e.data.buf,e.data.name)});}catch(err){self.postMessage({ok:false,msg:String((err&&err.message)||err)});}};';
@@ -1869,7 +1908,7 @@ function renderPerf() {
 /* ==========================================================================
    PERFORMANCE IMAGE
    ========================================================================== */
-const PERF_COL_W = [66, 60, 62, 64, 66, 62, 66];
+const PERF_COL_W = [74, 68, 70, 72, 74, 68, 72];
 function drawPerfDay(day, withTitle) {
   const S = 3, pad = 14, rowH = 26, headH = 40, titleH = withTitle ? 38 : 0;
   const cols = day.sunday ? PERF_LABELS : PERF_LABELS.filter((_, i) => i !== 5);
@@ -1961,9 +2000,9 @@ function drawPerfMultiDay(view, dates, withTitle) {
   const idxs = days.map(d => d.sunday ? [0, 1, 2, 3, 4, 5, 6] : [0, 1, 2, 3, 4, 6]);
   const scales = days.map(perfScales);
 
-  const S = 3, pad = 14, rowH = 30, headH1 = 26, headH2 = 38, titleH = withTitle ? 36 : 0;
+  const S = 3, pad = 14, rowH = 36, headH1 = 28, headH2 = 40, titleH = withTitle ? 36 : 0;
   const mc = document.createElement('canvas').getContext('2d'); mc.font = '13px Arial, Helvetica, sans-serif';
-  let w0 = 168;
+  let w0 = 180;
   canon.forEach(g => { w0 = Math.max(w0, Math.ceil(mc.measureText(g.mgr).width) + 20); g.hubs.forEach(h => { w0 = Math.max(w0, Math.ceil(mc.measureText('  ' + h.name).width) + 24); }); });
 
   const dateColW = idxs.map(idx => idx.map(i => PERF_COL_W[i]));
@@ -1987,7 +2026,7 @@ function drawPerfMultiDay(view, dates, withTitle) {
   const cellBox = (x, yy, w, h, fill) => { if (fill) { ctx.fillStyle = fill; ctx.fillRect(x, yy, w, h); } ctx.strokeStyle = '#BFBFBF'; ctx.lineWidth = 1; ctx.strokeRect(x + .5, yy + .5, w - 1, h - 1); };
 
   let x = pad;
-  ctx.font = 'bold 11px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+  ctx.font = 'bold 12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
   cellBox(x, y, w0, headH1 + headH2, '#D9E1F2'); ctx.fillStyle = '#000';
   ctx.fillText('CLUSTER/HUB', x + w0 / 2, y + (headH1 + headH2) / 2 + 1); x += w0;
   days.forEach((d, di) => { cellBox(x, y, blockW[di], headH1, '#D9E1F2'); ctx.fillStyle = '#000'; ctx.fillText(fmtDay(dates[di]) + (d.sunday ? ' (Sun)' : ''), x + blockW[di] / 2, y + headH1 / 2 + 1); x += blockW[di]; });
@@ -1997,7 +2036,7 @@ function drawPerfMultiDay(view, dates, withTitle) {
     idxs[di].forEach((i, k) => {
       cellBox(x, y, dateColW[di][k], headH2, '#D9E1F2'); ctx.fillStyle = '#000';
       const lines = wrapLines(ctx, PERF_LABELS[i], dateColW[di][k] - 6);
-      const lh = 13, top = y + headH2 / 2 - (lines.length * lh) / 2 + lh / 2;
+      const lh = 14, top = y + headH2 / 2 - (lines.length * lh) / 2 + lh / 2;
       lines.forEach((ln, j) => ctx.fillText(ln, x + dateColW[di][k] / 2, top + j * lh));
       x += dateColW[di][k];
     });
@@ -2006,7 +2045,7 @@ function drawPerfMultiDay(view, dates, withTitle) {
 
   const drawRow = (name, indent, getCells, bold, fill) => {
     let xx = pad;
-    cellBox(xx, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.font = (bold ? 'bold ' : '') + '14px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left';
+    cellBox(xx, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.font = (bold ? 'bold ' : '') + '16px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left';
     ctx.fillText((indent ? '  ' : '') + name, xx + 7, y + rowH / 2 + 1); xx += w0;
     days.forEach((d, di) => {
       const cells = getCells(di);
@@ -2014,7 +2053,7 @@ function drawPerfMultiDay(view, dates, withTitle) {
         const v = (cells || [])[i];
         const bg = fill || scaleColorPerf(v, scales[di] && scales[di][i]);
         cellBox(xx, y, dateColW[di][k], rowH, bg);
-        ctx.fillStyle = '#000'; ctx.font = 'bold 15px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';   // values always bold, for legibility
+        ctx.fillStyle = '#000'; ctx.font = 'bold 18px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';   // values always bold, for legibility
         ctx.fillText(v == null ? '\u2013' : perfFmtCell(i, v).replace('&ndash;', '\u2013'), xx + dateColW[di][k] / 2, y + rowH / 2 + 1);
         xx += dateColW[di][k];
       });
@@ -3474,11 +3513,13 @@ async function shareSlaImage() {
    OFD DONE, REPORT PENDING
    ========================================================================== */
 /* ---- screen ---- */
-function ofdpTableHTML(d) {
+function ofdpTableHTML(d, opts) {
+  opts = opts || {};
   let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm">HUB</th>' +
     d.dates.map(iso => '<th>' + esc(fmtDateLong(iso)) + '</th>').join('') + '<th>% CHANGE</th></tr></thead><tbody>';
   d.rows.forEach(r => {
-    h += '<tr' + (r.indent ? '' : ' style="font-weight:700;background:#F2F2F2"') + '><td class="nm">' + (r.indent ? '&nbsp;&nbsp;' : '') + esc(r.name) + '</td>' +
+    h += '<tr' + (r.indent ? '' : ' style="font-weight:700;background:#F2F2F2"') + '><td class="nm">' + (r.indent ? '&nbsp;&nbsp;' : '') + esc(r.name) +
+      (opts.static ? '' : '<button class="x" data-ofdprm="' + esc(r.key) + '" title="Leave out ' + esc(r.name) + '" aria-label="Leave out ' + esc(r.name) + '">&times;</button>') + '</td>' +
       r.vals.map(v => '<td>' + fmtInt(v) + '</td>').join('') +
       '<td style="background:' + (scaleColorPerf(r.pct, { min: 0, mid: 1, max: 2 }) || '') + '">' + fmtPct(r.pct) + '</td></tr>';
   });
@@ -3496,6 +3537,10 @@ function renderOfdp() {
     '<button class="link" id="clrOfdp">Clear saved data</button><span class="sp"></span>' +
     '<label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add date on images</label></div>';
   html += '<section class="panel" aria-label="OFD Done / Report Pending table"><div class="phead"><h2>OFD Done, Report Pending<span class="meta">Last ' + dates.length + ' day' + (dates.length === 1 ? '' : 's') + '</span></h2></div>' + ofdpTableHTML(d) + '</section>';
+  if (d.hidden.length) {
+    html += '<div class="tray"><p>Left out (' + d.hidden.length + ') \u2014 cities and hubs you\u2019ve excluded. Click one to add it back.</p><div class="chips">' +
+      d.hidden.map(r => '<button class="chip" data-ofdpadd="' + esc(r.key) + '">' + esc(r.name) + '</button>').join('') + '</div></div>';
+  }
   host.innerHTML = html;
   $('#pubBtn').onclick = startPublish;
   $('#dlOfdpImg').onclick = saveOfdpImage;
@@ -3504,6 +3549,8 @@ function renderOfdp() {
   $('#dlOfdpXls').onclick = downloadOfdpExcel;
   $('#clrOfdp').onclick = () => { if (window.confirm('Remove all saved OFD Done/Report Pending days from this browser?')) resetOfdpHistory(); };
   $('#optTitle').onchange = e => { state.showTitle = e.target.checked; };
+  host.querySelectorAll('[data-ofdprm]').forEach(b => b.onclick = () => ofdpSetChoice(b.dataset.ofdprm, 'out'));
+  host.querySelectorAll('[data-ofdpadd]').forEach(b => b.onclick = () => ofdpSetChoice(b.dataset.ofdpadd, 'in'));
 }
 
 /* ---- image ---- */
@@ -3598,10 +3645,10 @@ function render() {
   }
   const rs = $('#foot-reset');
   const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : state.report === 'fe' ? 'FE Dashboard' : state.report === 'sla' ? 'SLA/FASR/OFD' : state.report === 'ofdp' ? 'OFD Done/Report Pending' : 'DS Performance';
-  const canForget = state.report !== 'sla' && state.report !== 'ofdp';
+  const canForget = state.report !== 'sla';
   rs.innerHTML = '<button class="link" id="pubSettings">Publish settings</button>' + (canForget ? ' &nbsp; <button class="link" id="resetChoices">Forget saved ' + which + ' choices</button>' : '') +
     (storageOK ? '' : ' <span>(this browser is not allowing saved settings)</span>');
-  if (canForget) $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : state.report === 'fe' ? resetFeChoices() : resetDsHistory(); };
+  if (canForget) $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : state.report === 'fe' ? resetFeChoices() : state.report === 'ofdp' ? resetOfdpChoices() : resetDsHistory(); };
   $('#pubSettings').onclick = () => showPubSetup();
 }
 
@@ -3850,7 +3897,7 @@ function buildReportHTML() {
   }
   if (haveOfdp) {
     const d = computeOfdp(ofdpLastDays(OFDP_WINDOW));
-    body += '<div class="rsec" id="r-ofdp"' + (rtabs.length > 1 ? ' hidden' : '') + '><section class="panel"><div class="ph"><h2>OFD Done, Report Pending</h2><button type="button" data-ofdpimg>Save as image</button></div>' + ofdpTableHTML(d) + '</section></div>';
+    body += '<div class="rsec" id="r-ofdp"' + (rtabs.length > 1 ? ' hidden' : '') + '><section class="panel"><div class="ph"><h2>OFD Done, Report Pending</h2><button type="button" data-ofdpimg>Save as image</button></div>' + ofdpTableHTML(d, { static: true }) + '</section></div>';
   }
   body += '</div>';
   return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
@@ -4015,6 +4062,7 @@ loadDs();
 loadDso();
 loadFe();
 loadOfdp();
+loadOfdpChoices();
 loadPub();
 render();
 </script>
