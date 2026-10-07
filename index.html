@@ -1745,7 +1745,12 @@ function perfDay(view, date) {
 
   if (day.mode === 'fixed') {
     vh.structure.forEach(g => {
-      const hubs = g.hubs.filter(k => day.h[vh.names[k]]).map(k => ({ key: k, name: vh.names[k], cells: day.h[vh.names[k]] }));
+      const present = g.hubs.filter(k => day.h[vh.names[k]]);
+      const hubs = [];
+      present.forEach(k => {
+        const row = { key: k, name: vh.names[k], cells: day.h[vh.names[k]] };
+        if (ch[k] === 'out') hidden.push(row); else hubs.push(row);   // respect the same keep/leave choice as every other mode
+      });
       if (hubs.length) groups.push({ mgr: g.mgr, cells: day.m[g.mgr] || null, hubs });
     });
     return { view, date, sunday, groups, hidden, fresh, total: day.t, capped: false, fixed: true };
