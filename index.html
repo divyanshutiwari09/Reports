@@ -261,7 +261,8 @@ const REPORTS = [
   { id: 'dso',  name: 'DS OFD' },
   { id: 'fe',   name: 'FE Dashboard' },
   { id: 'sla',  name: 'SLA/FASR/OFD' },
-  { id: 'ofdp', name: 'OFD Done/Report Pending' }
+  { id: 'ofdp', name: 'OFD Done/Report Pending' },
+  { id: 'pin',  name: 'Pincode dashboard' }
 ];
 
 /* ---- OFD report ---- */
@@ -463,11 +464,19 @@ const deepCopy = o => JSON.parse(JSON.stringify(o));
    freezes and files are read in parallel), which is why they only use their own arguments and
    the few constants passed to the worker. Each file is recognised by its column headings.
    ========================================================================== */
+function pinNorm(v) {          // pincode as plain digits text: 400070, '400070', 400070.0
+  if (v == null) return '';
+  let s = String(v).trim();
+  if (/^\d+\.0+$/.test(s)) s = s.replace(/\.0+$/, '');
+  return s;
+}
+function pinHub(name) { return bkey(String(name == null ? '' : name).replace(/\(.*?\)/g, '')); }   // ignores tags like "(->Noida)"
 function parseOfdRows(rows, head) {
   const idx = {};
   OFD_REQUIRED.forEach(c => { idx[c] = head.indexOf(c.toLowerCase()); });
   const pktCol = head.indexOf('service type');   // optional: when present, only NDD packets are counted
-  const branches = new Map();
+  const pinCol = head.indexOf('delivery pincode'), cityCol = head.indexOf('delivery city');
+  const branches = new Map(), pins = pinCol >= 0 ? new Map() : null;   // pins: pincode + hub, for the Pincode dashboard
   let unassigned = 0, total = 0, skippedNonNdd = 0;
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
@@ -486,19 +495,30 @@ function parseOfdRows(rows, head) {
     const old = isY(row[idx['Old Pendency']]);
     const fresh = row[idx['Old Pendency']] != null && String(row[idx['Old Pendency']]).trim().toUpperCase() === 'N';
     const non = isY(row[idx['Non OFD']]);
-    if (old) a.reattempt++;
-    if (fresh) a.fresh++;
-    if (isY(row[idx['Intransit']])) a.intransit++;
-    if (isY(row[idx['Non OFD with FE']])) a.pendFE++;
-    if (isY(row[idx['Office Closed']])) a.oc++;
-    if (non && old) {
-      a.nonOld++;
-      const ta = row[idx['Total Attempt']];
-      if (ta != null && ta !== '' && Number(ta) === 0) a.nonOld0++;
+    const intr = isY(row[idx['Intransit']]), pfe = isY(row[idx['Non OFD with FE']]), oc = isY(row[idx['Office Closed']]);
+    let nz = false;
+    if (non && old) { const ta = row[idx['Total Attempt']]; nz = ta != null && ta !== '' && Number(ta) === 0; }
+    const add = t => {
+      if (old) t.reattempt++;
+      if (fresh) t.fresh++;
+      if (intr) t.intransit++;
+      if (pfe) t.pendFE++;
+      if (oc) t.oc++;
+      if (non && old) { t.nonOld++; if (nz) t.nonOld0++; }
+      if (non && fresh) t.nonNew++;
+    };
+    add(a);
+    if (pins) {
+      const pin = pinNorm(row[pinCol]);
+      if (pin) {
+        const pk = pin + pinHub(name);
+        let pa = pins.get(pk);
+        if (!pa) { pa = { key: pk, pin, name, city: cityCol >= 0 && row[cityCol] != null ? String(row[cityCol]).trim() : '', reattempt: 0, fresh: 0, intransit: 0, pendFE: 0, oc: 0, nonOld: 0, nonNew: 0, nonOld0: 0 }; pins.set(pk, pa); }
+        add(pa);
+      }
     }
-    if (non && fresh) a.nonNew++;
   }
-  return { kind: 'ofd', branches, unassigned, rows: total, skippedNonNdd, hasPacketType: pktCol >= 0 };
+  return { kind: 'ofd', branches, pins, unassigned, rows: total, skippedNonNdd, hasPacketType: pktCol >= 0 };
 }
 
 /* Daily performance: cleaning rules 1a-1d, the five views, and per-hub counters.
@@ -1041,6 +1061,44 @@ function computeOfdp(dates) {
   return { dates, rows, hidden };
 }
 
+function pinHeaderDate(v) {
+  if (v instanceof Date || (typeof v === 'number' && v > 30000 && v < 90000)) return codParseDate(v);
+  const s = v == null ? '' : String(v).trim();
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? codParseDate(s) : null;
+}
+function parsePinDash(rows, head) {
+  // the Pincode dashboard Excel: chk | Pincode | Branch | City | 5 groups of date columns | your own status columns
+  const hdr = rows[0] || [];
+  const S = v => (v == null ? '' : String(v).trim());
+  let end = 4; while (end < hdr.length && pinHeaderDate(hdr[end]) != null) end++;
+  const nCols = end - 4;
+  if (nCols % 5 !== 0) throw new Error('The date columns in this dashboard do not split into 5 equal groups (Fresh, Old, Sum, Total OFD done, Pendency).');
+  const N = nCols / 5, dates = [];
+  for (let j = 0; j < N; j++) {
+    const d = pinHeaderDate(hdr[4 + j]); dates.push(dsDateSlug(d));
+    for (let g = 1; g < 5; g++) if (pinHeaderDate(hdr[4 + g * N + j]) !== d) throw new Error('The date columns are not in the same order in all 5 groups of this dashboard.');
+  }
+  let last = hdr.length; while (last > end && S(hdr[last - 1]) === '') last--;
+  const extraHeaders = []; for (let c = end; c < last; c++) extraHeaders.push(S(hdr[c]));
+  const num = v => (typeof v === 'number' && isFinite(v)) ? v : null;   // #N/A and blanks both read as "no data"
+  const list = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row) continue;
+    const pin = pinNorm(row[1]), branch = S(row[2]);
+    if (!pin && !branch) continue;
+    const vals = {};
+    for (let j = 0; j < N; j++) {
+      const cells = []; let any = false;
+      for (let g = 0; g < 5; g++) { const v = num(row[4 + g * N + j]); cells.push(v); if (v != null) any = true; }
+      if (any) vals[dates[j]] = cells;
+    }
+    const extras = [];
+    for (let c = end; c < last; c++) { const v = row[c]; extras.push(v instanceof Date ? { date: codParseDate(v) } : (v == null || v === '' ? null : v)); }
+    list.push({ pin, pinNum: /^\d+$/.test(pin) ? Number(pin) : pin, branch, city: S(row[3]), key: pin + pinHub(branch), vals, extras });
+  }
+  if (!list.length) throw new Error('No pincode rows were found in this dashboard.');
+  return { kind: 'pin', dates, extraHeaders, rows: list.length, list };
+}
 function csvToRows(text) {
   // our own minimal CSV reader. SheetJS's CSV parser auto-sniffs date-looking text into Excel serials
   // using its own (not necessarily day-first) guess, even with cellDates off, so for CSV files we bypass
@@ -1083,6 +1141,7 @@ function parseAny(buf, name) {
   }
   if (!rows.length) throw new Error('The sheet is empty.');
   const head = rows[0].map(h => String(h == null ? '' : h).trim().toLowerCase());
+  if (head[0] === 'chk' && head[1] === 'pincode' && head[2] === 'branch' && head[3] === 'city') return parsePinDash(rows, head);
   const missing = list => list.filter(c => head.indexOf(c.toLowerCase()) < 0);
   const mc = missing(COD_NEEDED), mp = missing(PERF_REQUIRED), mo = missing(OFD_REQUIRED), md = missing(DS_REQUIRED), mf = missing(FE_REQUIRED), ms = missing(SLA_REQUIRED), mop = missing(OFDP_REQUIRED);
   if (!mc.length) return parseCodRows(rows, head);
@@ -1110,7 +1169,7 @@ function getWorkerURL() {
     ',PERF_DROP=' + JSON.stringify(PERF_DROP) + ',COD_REQUIRED=' + JSON.stringify(COD_REQUIRED) + ',COD_NEEDED=' + JSON.stringify(COD_NEEDED) +
     ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) + ',SLA_REQUIRED=' + JSON.stringify(SLA_REQUIRED) + ',OFDP_REQUIRED=' + JSON.stringify(OFDP_REQUIRED) +
     ';const bkey=' + bkey + ';const isY=' + isY + ';\n' +
-    csvToRows + '\n' + parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
+    csvToRows + '\n' + pinNorm + '\n' + pinHub + '\n' + pinHeaderDate + '\n' + parsePinDash + '\n' + parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
     dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + feSame + '\n' + parseFeRows + '\n' + parseFeDash +
     '\n' + slaParseTS + '\n' + slaDateOnly + '\n' + slaSecOfDay + '\n' + slaDateSlug + '\n' + slaBlank + '\n' + parseSlaRows + '\n' + parseOfdPendRows + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
     'self.onmessage=function(e){try{self.postMessage({ok:true,p:parseAny(e.data.buf,e.data.name)});}catch(err){self.postMessage({ok:false,msg:String((err&&err.message)||err)});}};';
@@ -1205,6 +1264,11 @@ async function processOne(f, rec) {
       applyOfdpFile();
       toast(f.name + ': added ' + fmtDateLong(p.date) + ' to OFD Done/Report Pending.');
       if (!state.picked) state.report = 'ofdp';
+    } else if (p.kind === 'pin') {
+      state.files.filter(x => x !== rec && x.kind === 'pin').forEach(x => { state.files = state.files.filter(y => y !== x); });
+      rec.pin = p; rec.rows = p.rows;
+      toast(f.name + ': dashboard loaded (' + p.rows + ' rows, ' + p.dates.length + ' date' + (p.dates.length === 1 ? '' : 's') + ').');
+      if (!state.picked) state.report = 'pin';
     } else if (p.kind === 'fe') {
       rec.rows = p.rows; applyFeRaw(p);
       toast(f.name + ': added ' + fmtDateLong(p.date) + ' to FE Dashboard history.');
@@ -1215,7 +1279,7 @@ async function processOne(f, rec) {
       if (!state.picked) state.report = 'fe';
 
     } else {
-      rec.branches = p.branches; rec.rows = p.rows; rec.unassigned = p.unassigned; rec.skippedNonNdd = p.skippedNonNdd; rec.hasPacketType = p.hasPacketType;
+      rec.branches = p.branches; rec.rows = p.rows; rec.unassigned = p.unassigned; rec.skippedNonNdd = p.skippedNonNdd; rec.hasPacketType = p.hasPacketType; rec.pins = p.pins;
       const z = detectZone(p.branches);
       if (z) {
         const prev = state.files.find(x => x !== rec && x.kind === 'ofd' && x.zone === z);
@@ -1259,7 +1323,7 @@ async function addFiles(fileList) {
   render();
 }
 
-const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : id === 'fe' ? feHasHistory() : id === 'sla' ? !!slaFile() : id === 'ofdp' ? ofdpHasHistory() : false;
+const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : id === 'fe' ? feHasHistory() : id === 'sla' ? !!slaFile() : id === 'ofdp' ? ofdpHasHistory() : id === 'pin' ? !!pinDashFile() || pinOfdFiles().length > 0 : false;
 
 
 /* ==========================================================================
@@ -3668,6 +3732,199 @@ async function downloadOfdpExcel() {
 
 
 /* ==========================================================================
+   PINCODE DASHBOARD
+   Drop your current dashboard Excel (Pincode / Branch / City + date columns + your status columns) and the
+   OFD raw files (the same files the OFD dashboard uses). The numbers per pincode + hub use the OFD
+   dashboard's own row formulas; the output is your dashboard Excel with a new date added.
+   ========================================================================== */
+const PIN_GROUPS = [
+  { name: 'Fresh shipments', fill: 'FF8FAADC' },
+  { name: 'Old packets', fill: 'FFFBE5D6' },
+  { name: 'Fresh + Old', fill: 'FFFFFF00' },
+  { name: 'Total OFD done', fill: 'FF92D050' },
+  { name: 'Pendency', fill: null }
+];
+const PIN_VISIBLE = 4;                       // newest dates left showing; older date columns are hidden in the Excel
+const PIN_SKIP_RE = /test|warehouse|office|collection|pickup\s*cent|^bsa/i;   // not real delivery hubs
+const PIN_CITY_BY_ZONE = { 'DELHI NDD': 'Delhi/NCR', 'MUMBAI': 'Mumbai', 'BENGALURU': 'Bengaluru', 'Zone B': 'Zone B' };
+const PIN_CITY_ORDER = ['Delhi/NCR', 'Mumbai', 'Bengaluru', 'Zone B'];
+const PIN_NEW_FILL = 'FFF4B183';
+
+const pinDashFile = () => state.files.find(f => f.kind === 'pin' && f.pin);
+const pinOfdFiles = () => state.files.filter(f => f.kind === 'ofd' && f.pins);
+function pinNameDate(name) {                  // dashboard_performance20261007151124.xlsx -> 2026-10-07
+  const s = String(name || '');
+  let m = /(\d{4})(\d{2})(\d{2})\d{6}/.exec(s) || /(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (!m || +m[2] < 1 || +m[2] > 12 || +m[3] < 1 || +m[3] > 31) return null;
+  return m[1] + '-' + m[2] + '-' + m[3];
+}
+function pinRunDate(files) {
+  const ds = files.map(f => pinNameDate(f.name)).filter(Boolean);
+  if (!ds.length) return { date: todayISO(), fromName: false, mixed: false };
+  const uniq = Array.from(new Set(ds)).sort();
+  return { date: uniq[uniq.length - 1], fromName: true, mixed: uniq.length > 1, all: uniq };
+}
+
+function computePin() {
+  const df = pinDashFile(), fl = pinOfdFiles();
+  if (!df || !fl.length) return null;
+  const M = df.pin, rd = pinRunDate(fl), date = rd.date;
+  // pincode + hub numbers, merged across the OFD files
+  const agg = new Map();
+  fl.forEach(f => f.pins.forEach((a, k) => {
+    const t = agg.get(k);
+    if (!t) agg.set(k, Object.assign({}, a, { zone: f.zone }));
+    else ['reattempt', 'fresh', 'intransit', 'pendFE', 'oc', 'nonOld', 'nonNew', 'nonOld0'].forEach(x => { t[x] += a[x]; });
+  }));
+  // the OFD dashboard's own formulas (negative new-OFD-done moves into old OFD done), then anything negative becomes 0
+  const calc = new Map();
+  agg.forEach((a, k) => {
+    const c = calcRow(a).cells;               // [name, C old, D fresh, E intransit, F pending FE, G to be done, H old done, I new done, J total done, ...]
+    const done = Math.max(0, c[8]);
+    calc.set(k, [Math.max(0, c[2]), Math.max(0, c[1]), Math.max(0, c[1] + c[2]), done, Math.max(0, c[5] - done)]);
+  });
+  const hubCity = new Map(); M.list.forEach(r => { const h = pinHub(r.branch); if (!hubCity.has(h)) hubCity.set(h, r.city); });
+  const used = new Set();
+  const rows = M.list.map(r => { const v = calc.get(r.key) || null; if (v) used.add(r.key); return { src: r, isNew: false, vals: v }; });
+  const added = [], skipped = new Map();
+  agg.forEach((a, k) => {
+    if (used.has(k) || (!a.reattempt && !a.fresh)) return;
+    if (PIN_SKIP_RE.test(a.name)) { skipped.set(a.name, (skipped.get(a.name) || 0) + a.reattempt + a.fresh); return; }
+    const city = hubCity.get(pinHub(a.name)) || PIN_CITY_BY_ZONE[a.zone] || a.city;
+    added.push({ src: { pin: a.pin, pinNum: /^\d+$/.test(a.pin) ? Number(a.pin) : a.pin, branch: a.name, city, key: k, vals: {}, extras: [] }, isNew: true, vals: calc.get(k), n: a.reattempt + a.fresh });
+  });
+  const co = c => { const i = PIN_CITY_ORDER.indexOf(c); return i < 0 ? 99 : i; };
+  added.sort((x, y) => co(x.src.city) - co(y.src.city) || x.src.branch.localeCompare(y.src.branch) || String(x.src.pin).localeCompare(String(y.src.pin)));
+  const all = rows.concat(added);
+  const dateSet = new Set(M.dates); const overwritten = dateSet.has(date); dateSet.add(date);
+  const cityTotals = new Map();
+  all.forEach(r => { if (!r.vals) return; let t = cityTotals.get(r.src.city); if (!t) { t = [0, 0, 0, 0, 0]; cityTotals.set(r.src.city, t); } r.vals.forEach((v, i) => { t[i] += v; }); });
+  return {
+    model: M, date, rd, overwritten, dates: Array.from(dateSet).sort(), rows: all, added,
+    skipped: Array.from(skipped.entries()).map(([name, n]) => ({ name, n })),
+    stats: { masterRows: rows.length, withOrders: rows.filter(r => r.vals).length, noOrders: rows.filter(r => !r.vals).length, newRows: added.length, newShipments: added.reduce((s, r) => s + r.n, 0) },
+    cityTotals: Array.from(cityTotals.entries()).sort((a, b) => co(a[0]) - co(b[0]))
+  };
+}
+
+/* ---- Excel ---- */
+function buildPinWorkbook(res) {
+  const M = res.model, dates = res.dates, N = dates.length, first = 5, extraStart = first + 5 * N, nEx = M.extraHeaders.length;
+  const lastRow = res.rows.length + 1;
+  const wb = new ExcelJS.Workbook(); wb.created = new Date();
+  const ws = wb.addWorksheet('Sheet1', { views: [{ state: 'frozen', xSplit: 4, ySplit: 1 }] });
+  const thin = { style: 'thin' }, border = { top: thin, left: thin, bottom: thin, right: thin };
+  const fill = argb => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+  const CEN = { horizontal: 'center', vertical: 'middle' }, HEAD = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  const colOf = (g, j) => first + g * N + j;
+  const exIdx = h => M.extraHeaders.findIndex(x => x.toLowerCase() === h);
+  const exCol = i => extraStart + i;
+  const dlCol = exIdx('deactivation date') >= 0 ? openpyxlCol(exCol(exIdx('deactivation date'))) : null;
+
+  ['chk', 'Pincode', 'Branch', 'City'].forEach((h, i) => { const c = ws.getCell(1, i + 1); c.value = h; c.font = { bold: true }; c.alignment = HEAD; c.border = border; });
+  dates.forEach((iso, j) => {
+    const p = iso.split('-');
+    for (let g = 0; g < 5; g++) {
+      const c = ws.getCell(1, colOf(g, j));
+      c.value = new Date(Date.UTC(+p[0], +p[1] - 1, +p[2])); c.numFmt = 'd-mmm'; c.font = { bold: true }; c.alignment = HEAD; c.border = border;
+      if (PIN_GROUPS[g].fill) c.fill = fill(PIN_GROUPS[g].fill);
+    }
+  });
+  M.extraHeaders.forEach((h, i) => { const c = ws.getCell(1, exCol(i)); c.value = h; c.font = { bold: true }; c.alignment = HEAD; c.border = border; });
+  ws.getRow(1).height = 29;
+
+  res.rows.forEach((row, i) => {
+    const r = i + 2, s = row.src;
+    const a = ws.getCell(r, 1); a.value = { formula: 'CONCATENATE(B' + r + ',C' + r + ')', result: String(s.pinNum) + s.branch }; a.border = border;
+    [[2, s.pinNum], [3, s.branch], [4, s.city]].forEach(([c, v]) => { const x = ws.getCell(r, c); x.value = v; x.border = border; });
+    if (row.isNew) for (let c = 1; c <= 4; c++) ws.getCell(r, c).fill = fill(PIN_NEW_FILL);
+    const byDate = Object.assign({}, s.vals);
+    if (row.vals) byDate[res.date] = row.vals; else delete byDate[res.date];
+    dates.forEach((iso, j) => {
+      const v = byDate[iso] || null;
+      for (let g = 0; g < 5; g++) {
+        const c = ws.getCell(r, colOf(g, j));
+        if (v && v[g] != null) c.value = v[g];
+        c.alignment = CEN; c.border = border;
+        if (PIN_GROUPS[g].fill) c.fill = fill(PIN_GROUPS[g].fill);
+      }
+    });
+    M.extraHeaders.forEach((h, k) => {
+      const c = ws.getCell(r, exCol(k)), v = s.extras[k] == null ? null : s.extras[k];
+      c.border = border;
+      if (h.toLowerCase() === 'deactivation days' && dlCol) c.value = { formula: 'IF(' + dlCol + r + '="","",TODAY()-' + dlCol + r + ')' };
+      else if (v && typeof v === 'object' && v.date != null) { c.value = new Date(v.date); c.numFmt = 'mm-dd-yy'; }
+      else if (v != null) c.value = v;
+    });
+  });
+
+  // widths, and older date columns hidden (only the newest PIN_VISIBLE dates stay showing)
+  [6.5, 7.5, 28.8, 9.4].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+  dates.forEach((iso, j) => { for (let g = 0; g < 5; g++) { const col = ws.getColumn(colOf(g, j)); col.width = 6.5; if (j < N - PIN_VISIBLE) col.hidden = true; } });
+  M.extraHeaders.forEach((h, k) => { const l = h.toLowerCase(); ws.getColumn(exCol(k)).width = l.indexOf('status in') === 0 ? 14.9 : l === 'deactivation date' ? 10.2 : l === 'deactivation days' ? 10 : l === 'requested by' ? 19.5 : l === 'status' ? 7.3 : 12; });
+
+  let pr = 0;
+  // heat map on every Pendency column (low = green, high = red), one scale per date
+  for (let j = 0; j < N; j++) {
+    const L = openpyxlCol(colOf(4, j));
+    ws.addConditionalFormatting({ ref: L + '2:' + L + lastRow, rules: [{ type: 'colorScale', priority: ++pr, cfvo: [{ type: 'min' }, { type: 'percentile', value: 50 }, { type: 'max' }], color: [{ argb: 'FF63BE7B' }, { argb: 'FFFFEB84' }, { argb: 'FFF8696B' }] }] });
+  }
+  // status columns, same colours as before; pincodes that appear twice are flagged
+  const stCols = M.extraHeaders.map((h, k) => h.toLowerCase().indexOf('status in') === 0 ? exCol(k) : 0).filter(Boolean);
+  if (stCols.length) {
+    const ref = openpyxlCol(Math.min.apply(null, stCols)) + '2:' + openpyxlCol(Math.max.apply(null, stCols)) + lastRow;
+    const sty = argb => ({ fill: { type: 'pattern', pattern: 'solid', bgColor: { argb } } });
+    ws.addConditionalFormatting({ ref, rules: [
+      { type: 'containsText', operator: 'containsText', text: 'Temporary Block', style: sty('FFFF0000'), priority: ++pr },
+      { type: 'containsText', operator: 'containsText', text: 'Inactive', style: sty('FFFFFF00'), priority: ++pr },
+      { type: 'containsText', operator: 'containsText', text: 'Active', style: sty('FF92D050'), priority: ++pr }
+    ] });
+  }
+  ws.addConditionalFormatting({ ref: 'B2:B' + lastRow, rules: [{ type: 'expression', formulae: ['COUNTIF($B$2:$B$' + lastRow + ',B2)>1'], priority: ++pr,
+    style: { font: { color: { argb: 'FF9C0006' } }, fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFFC7CE' } } } }] });
+  return wb;
+}
+async function downloadPinExcel() {
+  const res = computePin();
+  if (!res) { toast('Drop your dashboard Excel and the OFD raw files first.', true); return; }
+  try {
+    const name = 'Pincode_dashboard_' + res.date + '.xlsx';
+    saveBlob(new Blob([await buildPinWorkbook(res).xlsx.writeBuffer()], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), name);
+    toast('Saved ' + name);
+  } catch (e) { console.error(e); toast('Excel could not be created: ' + e.message, true); }
+}
+
+/* ---- page: a short summary, the Excel is the point ---- */
+function renderPin() {
+  const host = $('#results'), df = pinDashFile(), fl = pinOfdFiles(), res = computePin();
+  const tick = ok => '<span style="font-weight:700;color:' + (ok ? '#1a7f37' : '#b42318') + '">' + (ok ? '\u2713' : '\u2717') + '</span> ';
+  let html = '<section class="panel"><div class="phead"><h2>Pincode dashboard</h2></div><div style="padding:6px 16px 14px;line-height:1.7">';
+  html += '<div>' + tick(!!df) + '<b>Your dashboard Excel</b> ' + (df ? '\u2014 ' + esc(df.name) + ' &middot; ' + fmtInt(df.pin.rows) + ' rows &middot; dates: ' + df.pin.dates.map(d => esc(fmtDateLong(d))).join(', ') :
+    '\u2014 not loaded. Drop your current dashboard file (the one with Pincode, Branch and City columns).') + '</div>';
+  html += '<div>' + tick(fl.length > 0) + '<b>OFD raw files</b> ' + (fl.length ? '\u2014 ' + fl.map(f => esc(f.zone || f.name) + ' (' + fmtInt(f.pins.size) + ' pincode + hub)').join(', ') : '\u2014 not loaded. Drop the same OFD files you use for the OFD dashboard.') + '</div>';
+  if (fl.length && fl.length < 4) html += '<div class="note">Only ' + fl.length + ' of the 4 OFD files are loaded, so the cities of the missing files will come out blank.</div>';
+  html += '</div></section>';
+  if (!res) { host.innerHTML = html; return; }
+  const st = res.stats;
+  html += '<div class="bar"><button class="btn primary" id="dlPinXls">Download updated Excel</button><span class="sp"></span></div>';
+  html += '<section class="panel"><div class="phead"><h2>' + esc(fmtDateLong(res.date)) + '<span class="meta">' + (res.overwritten ? 'this date already existed in your file and will be replaced' : 'new date column added') + '</span></h2></div><div style="padding:6px 16px 14px;line-height:1.7">';
+  if (!res.rd.fromName) html += '<div class="note">The OFD file names have no date, so today\u2019s date was used.</div>';
+  else if (res.rd.mixed) html += '<div class="note">The OFD files are from different dates (' + res.rd.all.map(d => esc(fmtDateLong(d))).join(', ') + '). The latest one is used.</div>';
+  html += '<div>' + fmtInt(st.withOrders) + ' of your ' + fmtInt(st.masterRows) + ' rows have orders; ' + fmtInt(st.noOrders) + ' have none today and stay blank.</div>';
+  html += '<div>' + fmtInt(st.newRows) + ' new pincode + hub rows added at the bottom (highlighted orange), carrying ' + fmtInt(st.newShipments) + ' shipments.' + (res.skipped.length ? ' Skipped as not real hubs: ' + res.skipped.map(s => esc(s.name) + ' (' + s.n + ')').join(', ') + '.' : '') + '</div>';
+  html += '<div>Older date columns are hidden, the newest ' + PIN_VISIBLE + ' stay visible. Your status columns are carried over unchanged.</div></div>';
+  html += '<div class="scroller"><table class="grid"><thead><tr><th class="nm">CITY</th>' + PIN_GROUPS.map(g => '<th>' + esc(g.name) + '</th>').join('') + '</tr></thead><tbody>' +
+    res.cityTotals.map(([c, t]) => '<tr><td class="nm">' + esc(c) + '</td>' + t.map(v => '<td>' + fmtInt(v) + '</td>').join('') + '</tr>').join('') + '</tbody></table></div></section>';
+  if (res.added.length) {
+    const top = res.added.slice().sort((a, b) => b.n - a.n).slice(0, 12);
+    html += '<section class="panel"><div class="phead"><h2>New rows<span class="meta">largest ' + top.length + ' of ' + res.added.length + '</span></h2></div><div class="scroller"><table class="grid"><thead><tr><th>PINCODE</th><th class="nm">HUB</th><th>CITY</th><th>SHIPMENTS</th></tr></thead><tbody>' +
+      top.map(r => '<tr><td>' + esc(String(r.src.pin)) + '</td><td class="nm">' + esc(r.src.branch) + '</td><td>' + esc(r.src.city) + '</td><td>' + fmtInt(r.n) + '</td></tr>').join('') + '</tbody></table></div></section>';
+  }
+  host.innerHTML = html;
+  $('#dlPinXls').onclick = downloadPinExcel;
+}
+
+/* ==========================================================================
    TOP-LEVEL RENDER
    ========================================================================== */
 function render() {
@@ -3675,11 +3932,11 @@ function render() {
   if (state.report === 'ofd') { renderSlots(); renderHint(); renderFix(); renderOfd(); }
   else {
     $('#slots').innerHTML = ''; $('#hint').innerHTML = ''; $('#fix').innerHTML = '';
-    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : state.report === 'dso' ? renderDso() : state.report === 'fe' ? renderFe() : state.report === 'sla' ? renderSla() : state.report === 'ofdp' ? renderOfdp() : renderDs();
+    state.report === 'perf' ? renderPerf() : state.report === 'cod' ? renderCod() : state.report === 'dso' ? renderDso() : state.report === 'fe' ? renderFe() : state.report === 'sla' ? renderSla() : state.report === 'ofdp' ? renderOfdp() : state.report === 'pin' ? renderPin() : renderDs();
   }
   const rs = $('#foot-reset');
-  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : state.report === 'fe' ? 'FE Dashboard' : state.report === 'sla' ? 'SLA/FASR/OFD' : state.report === 'ofdp' ? 'OFD Done/Report Pending' : 'DS Performance';
-  const canForget = state.report !== 'sla';
+  const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : state.report === 'fe' ? 'FE Dashboard' : state.report === 'sla' ? 'SLA/FASR/OFD' : state.report === 'ofdp' ? 'OFD Done/Report Pending' : state.report === 'pin' ? 'Pincode dashboard' : 'DS Performance';
+  const canForget = state.report !== 'sla' && state.report !== 'pin';
   rs.innerHTML = '<button class="link" id="pubSettings">Publish settings</button>' + (canForget ? ' &nbsp; <button class="link" id="resetChoices">Forget saved ' + which + ' choices</button>' : '') +
     (storageOK ? '' : ' <span>(this browser is not allowing saved settings)</span>');
   if (canForget) $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : state.report === 'fe' ? resetFeChoices() : state.report === 'ofdp' ? resetOfdpChoices() : resetDsHistory(); };
