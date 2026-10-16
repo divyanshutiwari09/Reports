@@ -1740,8 +1740,10 @@ function applyPerfFile() {
   const f = perfFile();
   if (!f) return;
   const date = f.date;
+  const moved = [];
   PERF_VIEWS.forEach(view => {
     const vh = perfHistory.views[view];
+    const asOf = vh.mgrAsOf || (vh.mgrAsOf = {});   // hubKey -> date of the raw file that last set its manager
     const src = f.perf.views[view];   // Map: hubKey -> {name, mgrs, fe, feAll, c}
     const hubs = {};
     src.forEach((a, key) => {
@@ -1757,13 +1759,25 @@ function applyPerfFile() {
         grp = vh.structure.find(g => g.mgr === mgr);
         if (!grp) { grp = { mgr, hubs: [] }; vh.structure.push(grp); }
         grp.hubs.push(key);
+        asOf[key] = date;
         if (!(key in perfChoices[view])) perfChoices[view][key] = null;   // null = undecided -> shown as NEW
-      }
+      } else if (grp.mgr !== mgr && (asOf[key] == null || date >= asOf[key])) {
+        // the raw file names a different cluster manager for this hub: follow it (a new manager, or a hub moved
+        // between managers). Only a file at least as new as the last one that placed the hub can do this, so
+        // loading an older day later never undoes a change.
+        grp.hubs = grp.hubs.filter(k => k !== key);
+        let ng = vh.structure.find(g => g.mgr === mgr);
+        if (!ng) { ng = { mgr, hubs: [] }; vh.structure.push(ng); }
+        ng.hubs.push(key);
+        asOf[key] = date;
+        moved.push(a.name + ' \u2192 ' + mgr);
+      } else if (grp.mgr === mgr && (asOf[key] == null || date > asOf[key])) asOf[key] = date;
     });
     vh.days[date] = { mode: 'raw', hubs };
   });
   savePerfHistory(); savePerfChoices();
   cleanupOldMonth(date);
+  if (moved.length) toast('Cluster manager changes picked up from the file: ' + moved.slice(0, 4).join('; ') + (moved.length > 4 ? ' and ' + (moved.length - 4) + ' more' : '') + '.');
 }
 
 function unapplyPerfFile() { /* files are parsed straight into history; nothing to undo on removal */ }
@@ -1810,7 +1824,10 @@ function perfDay(view, date) {
   const gtTotals = [], gtFE = [];
 
   if (day.mode === 'fixed') {
-    vh.structure.forEach(g => {
+    // these days only hold final numbers per manager, so they keep the grouping of the master workbook they came from
+    const sv = window.__SEED__ && window.__SEED__.perf && window.__SEED__.perf.views[view];
+    const fixedStructure = sv ? sv.structure.map(g => ({ mgr: g.mgr, hubs: g.hubs.map(bkey) })) : vh.structure;
+    fixedStructure.forEach(g => {
       const present = g.hubs.filter(k => day.h[vh.names[k]]);
       const hubs = [];
       present.forEach(k => {
