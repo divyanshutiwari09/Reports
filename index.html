@@ -314,7 +314,12 @@ const DS_PCT = [1, 2, 3, 4];
 const DS_COL_W = [72, 68, 78, 60, 64];
 const DSO_EXTRA = ['STATUS', 'PACKED', 'OFD', 'ATTEMPT COMPLIANCE', 'EDD TIME'];
 const FE_REQUIRED = ['DATE', 'DELIVERY CENTRE', 'PAYOUT TYPE', 'ALLOCATED ROUTE', 'ACTUAL ROUTE', 'TOTAL DELIVERY', 'OUT OF TAT DELIVERY'];
-const SLA_REQUIRED = ['REACHED_HUB_TIMESTAMP', 'ATTEMPT 1 TIME', 'DELIVERED_TIMESTAMP', 'OUT_FOR_DELIVERY_TIMESTAMP', 'OTP_VERIFIED_TIMESTAMP', 'CANCELLED_TIMESTAMP', 'PAYMENT TYPE', 'ARRIVED AT WAREHOUSE'];
+const SLA_REQUIRED = ['REACHED_HUB_TIMESTAMP', 'ATTEMPT 1 TIME', 'DELIVERED_TIMESTAMP', 'OUT_FOR_DELIVERY_TIMESTAMP', 'OTP_VERIFIED_TIMESTAMP', 'CANCELLED_TIMESTAMP', 'PAYMENT TYPE', 'ARRIVED AT WAREHOUSE', 'DEST WAREHOUSE'];
+// Only these four branches are reported; any other DEST WAREHOUSE is ignored. A branch matches when its DEST WAREHOUSE
+// starts with the key (spaces, underscores and case ignored), so 'Shalimar Bagh_ND_PD' and a renamed suffix both work.
+const SLA_BRANCHES = [{ key: 'SHALIMARBAGH', label: 'Shalimar Bagh' }, { key: 'SANTNAGAR', label: 'Sant Nagar' },
+  { key: 'PAHARGANJ', label: 'Paharganj' }, { key: 'DAYALBAGH', label: 'Dayal Bagh' }];
+const SLA_WINDOW = 15;   // latest dates shown
 const DS_WINDOW = 2;     // days shown on screen, in the image and on the shared page
 const DS_CLEAN_DAY = 5;  // last month's DS Performance data is cleared once the report date reaches the 5th
 const COD_BUCKET_KEYS = ['1', '2', '3', '4-5', '6-30', '>30'];
@@ -904,16 +909,22 @@ function slaBlank() {
 function parseSlaRows(rows, head) {
   const col = n => head.indexOf(n.toLowerCase());
   const C = { rad: col('REACHED_HUB_TIMESTAMP'), att1: col('ATTEMPT 1 TIME'), del: col('DELIVERED_TIMESTAMP'),
-    ofd: col('OUT_FOR_DELIVERY_TIMESTAMP'), otp: col('OTP_VERIFIED_TIMESTAMP'), canc: col('CANCELLED_TIMESTAMP'), pay: col('PAYMENT TYPE') };
+    ofd: col('OUT_FOR_DELIVERY_TIMESTAMP'), otp: col('OTP_VERIFIED_TIMESTAMP'), canc: col('CANCELLED_TIMESTAMP'), pay: col('PAYMENT TYPE'),
+    dest: col('DEST WAREHOUSE') };
   const S = v => (v == null ? '' : String(v).trim());
-  const days = new Map(), grand = slaBlank();
-  let total = 0;
+  const branches = SLA_BRANCHES.map(b => ({ key: b.key, label: b.label, days: new Map(), total: 0 }));
+  const allDates = new Set();
+  let total = 0, other = 0;
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r]; if (!row || !row.length) continue;
     const radMs = slaParseTS(row[C.rad]); if (radMs == null) continue;    // every metric is keyed off RAD (reached-hub) being present
-    total++;
+    const dk = bkey(S(row[C.dest]));
+    const br = branches.find(x => dk.indexOf(x.key) === 0);
+    if (!br) { other++; continue; }                                         // not one of the four branches
+    total++; br.total++;
     const radDate = slaDateOnly(radMs), iso = slaDateSlug(radDate);
-    let day = days.get(iso); if (!day) { day = slaBlank(); days.set(iso, day); }
+    allDates.add(iso);
+    let day = br.days.get(iso); if (!day) { day = slaBlank(); br.days.set(iso, day); }
 
     const att1Ms = slaParseTS(row[C.att1]);
     const att1Date = att1Ms == null ? null : slaDateOnly(att1Ms);
@@ -925,31 +936,29 @@ function parseSlaRows(rows, head) {
     const pay = S(row[C.pay]);
     const otpMs = slaParseTS(row[C.otp]), cancMs = slaParseTS(row[C.canc]), ofdMs = slaParseTS(row[C.ofd]);
 
-    const bump = a => {
-      a.total++;
-      if (diff === 0) a.slaNew++;
-      if (!diffIsNA) {
-        a.slaOldNum++;
-        if (pay === 'PREPAID') { a.ppdMatDen++; if (fasr === 0) a.ppdMatNum++; }
-        if (pay === 'COD') { a.codMatDen++; if (fasr === 0) a.codMatNum++; }
-        if (otpMs != null || cancMs != null) a.dvMatNum++;
-      }
-      if (diff === 0) {
-        if (pay === 'PREPAID') { a.ppdSdDen++; if (fasr === 0) a.ppdSdNum++; }
-        if (pay === 'COD') { a.codSdDen++; if (fasr === 0) a.codSdNum++; }
-        a.dvSdDen++;
-        if ((otpMs != null && slaDateOnly(otpMs) === radDate) || (cancMs != null && slaDateOnly(cancMs) === radDate)) a.dvSdNum++;
-      }
-      if (ofdMs != null) {
-        const sec = slaSecOfDay(ofdMs);
-        if (sec < 30600) a.ofd830++;      // 8*3600+30*60
-        if (sec < 34200) a.ofd930++;      // 9*3600+30*60
-      }
-    };
-    bump(day); bump(grand);
+    const a = day;
+    a.total++;
+    if (diff === 0) a.slaNew++;
+    if (!diffIsNA) {
+      a.slaOldNum++;
+      if (pay === 'PREPAID') { a.ppdMatDen++; if (fasr === 0) a.ppdMatNum++; }
+      if (pay === 'COD') { a.codMatDen++; if (fasr === 0) a.codMatNum++; }
+      if (otpMs != null || cancMs != null) a.dvMatNum++;
+    }
+    if (diff === 0) {
+      if (pay === 'PREPAID') { a.ppdSdDen++; if (fasr === 0) a.ppdSdNum++; }
+      if (pay === 'COD') { a.codSdDen++; if (fasr === 0) a.codSdNum++; }
+      a.dvSdDen++;
+      if ((otpMs != null && slaDateOnly(otpMs) === radDate) || (cancMs != null && slaDateOnly(cancMs) === radDate)) a.dvSdNum++;
+    }
+    if (ofdMs != null) {
+      const sec = slaSecOfDay(ofdMs);
+      if (sec < 30600) a.ofd830++;      // 8*3600+30*60
+      if (sec < 34200) a.ofd930++;      // 9*3600+30*60
+    }
   }
-  if (!days.size) throw new Error('No rows with a REACHED_HUB_TIMESTAMP date were found.');
-  return { kind: 'sla', days, grand, total, dates: Array.from(days.keys()).sort(), rows: total };
+  if (!total) throw new Error('No rows for Shalimar Bagh, Sant Nagar, Paharganj or Dayal Bagh (DEST WAREHOUSE) with a REACHED_HUB_TIMESTAMP date were found.');
+  return { kind: 'sla', branches, total, other, dates: Array.from(allDates).sort(), rows: total };
 }
 function slaMetrics(a) {
   return [a.total,
@@ -1167,7 +1176,7 @@ function getWorkerURL() {
   const lib = document.getElementById('xlsx-src').textContent;
   const code = lib + '\n;const OFD_REQUIRED=' + JSON.stringify(OFD_REQUIRED) + ',PERF_REQUIRED=' + JSON.stringify(PERF_REQUIRED) +
     ',PERF_DROP=' + JSON.stringify(PERF_DROP) + ',COD_REQUIRED=' + JSON.stringify(COD_REQUIRED) + ',COD_NEEDED=' + JSON.stringify(COD_NEEDED) +
-    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) + ',SLA_REQUIRED=' + JSON.stringify(SLA_REQUIRED) + ',OFDP_REQUIRED=' + JSON.stringify(OFDP_REQUIRED) +
+    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) + ',SLA_REQUIRED=' + JSON.stringify(SLA_REQUIRED) + ',SLA_BRANCHES=' + JSON.stringify(SLA_BRANCHES) + ',OFDP_REQUIRED=' + JSON.stringify(OFDP_REQUIRED) +
     ';const bkey=' + bkey + ';const isY=' + isY + ';\n' +
     csvToRows + '\n' + pinNorm + '\n' + pinHub + '\n' + pinHeaderDate + '\n' + parsePinDash + '\n' + parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
     dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + feSame + '\n' + parseFeRows + '\n' + parseFeDash +
@@ -3507,10 +3516,12 @@ async function downloadFeExcel() {
    DAILY SLA / FASR / OFD REPORT  (Summary only — no history, no Excel; each file
    already covers a full rolling month and fully replaces the one before it)
    ========================================================================== */
-const SLA_LABELS = ['Date', 'Total AWB', 'SLA', 'FASR PPD (same day)', 'FASR COD (same day)', 'Delivered+VC (Same Day)',
-  'OFD Before 8:30', 'OFD Before 9:30', 'SLA Matured', 'PPD FASR (matured)', 'COD FASR (matured)', 'Delivered+VC (Matured)'];
-const SLA_PCT = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];    // every column except Total AWB (0) and Date
-const SLA_COL_W = [80, 68, 96, 96, 108, 84, 84, 76, 96, 96, 110];
+// Two pages, one image each: same-day numbers and matured numbers. Rows are branch -> metric, columns are the latest dates.
+const SLA_PAGES = [
+  { id: 'same', tag: 'Same day', title: 'Daily SLA / FASR \u2013 Same day', cols: [0, 1, 2, 3, 4], labels: ['Total AWB', 'SLA', 'PPD FASR', 'COD FASR', 'Del+VC'] },
+  { id: 'mat', tag: 'Matured', title: 'Daily SLA / FASR \u2013 Matured', cols: [0, 7, 8, 9, 10], labels: ['Total AWB', 'SLA Matured', 'PPD FASR Matured', 'COD FASR Matured', 'Del+VC Matured'] }
+];
+const SLA_W = { b: 118, m: 158, d: 60 };   // image column widths: branch, metric, each date
 const slaFile = () => state.files.find(f => f.kind === 'sla' && f.sla);
 function slaScale(vals) {
   const v = vals.filter(x => x != null).sort((a, b) => a - b);
@@ -3518,109 +3529,121 @@ function slaScale(vals) {
   const pos = (v.length - 1) * 0.5, lo = Math.floor(pos), hi = Math.ceil(pos);
   return { min: v[0], mid: v[lo] + (v[hi] - v[lo]) * (pos - lo), max: v[v.length - 1] };
 }
-function slaFmt(i, v) { return v == null ? '\u2013' : (i === 0 ? fmtInt(v) : fmtPct(v)); }
-function computeSla() {
+function slaFmt(ci, v) { return v == null ? '\u2013' : (ci === 0 ? fmtInt(v) : fmtPct(v)); }
+function slaDayLabel(iso) { return +iso.slice(8, 10) + '-' + MON[+iso.slice(5, 7) - 1]; }
+function slaBg(v, scale) { return v == null ? null : scaleColorPerf(v, scale); }
+function computeSla(pageId) {
   const f = slaFile(); if (!f) return null;
-  const p = f.sla;
-  const rows = p.dates.map(iso => ({ iso, cells: slaMetrics(p.days.get(iso)) }));
-  const total = { cells: slaMetrics(p.grand) };
-  // Total AWB (col 0) is scaled on daily rows only, matching the report's own rule; every % column
-  // is scaled including the Grand Total row.
-  const scales = {};
-  scales[0] = slaScale(rows.map(r => r.cells[0]));
-  SLA_PCT.forEach(c => { scales[c] = slaScale(rows.map(r => r.cells[c]).concat([total.cells[c]])); });
-  return { dates: p.dates, rows, total, scales, allRows: total.cells[0] };
-}
-function slaBg(col, v, scales, isGrand) {
-  if (isGrand && col === 0) return null;   // Grand Total's Total AWB is intentionally left uncoloured
-  return v == null ? null : scaleColorPerf(v, scales[col]);
-}
-function slaTableHTML(d, opts) {
-  opts = opts || {};
-  let h = '<div class="scroller"><table class="grid"><thead><tr>' + SLA_LABELS.map((l, i) => '<th' + (i === 0 ? ' class="nm"' : '') + '>' + esc(l) + '</th>').join('') + '</tr></thead><tbody>';
-  d.rows.forEach(r => {
-    h += '<tr><td class="nm">' + esc(fmtDateLong(r.iso)) + '</td>' +
-      r.cells.map((v, i) => { const bg = slaBg(i, v, d.scales, false); return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + esc(slaFmt(i, v)) + '</td>'; }).join('') + '</tr>';
+  const p = f.sla, pg = SLA_PAGES.find(x => x.id === pageId) || SLA_PAGES[0];
+  const dates = p.dates.slice(-SLA_WINDOW);
+  const branches = p.branches.map(b => {
+    const m = dates.map(iso => { const a = b.days.get(iso); return a ? slaMetrics(a) : null; });
+    return { label: b.label, rows: pg.cols.map((ci, k) => ({ label: pg.labels[k], ci, cells: m.map(x => (x ? x[ci] : null)) })) };
   });
-  h += '<tr class="tot"><td class="nm">Grand Total</td>' + d.total.cells.map((v, i) => { const bg = slaBg(i, v, d.scales, true); return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + esc(slaFmt(i, v)) + '</td>'; }).join('') + '</tr>';
+  // Heat colours: Total AWB is scaled along its own branch row (branches differ in size); every % metric is scaled
+  // across all branches and dates so the same metric is comparable between branches.
+  pg.cols.forEach((ci, k) => {
+    if (ci === 0) branches.forEach(b => { b.rows[k].scale = slaScale(b.rows[k].cells); });
+    else { const sc = slaScale([].concat.apply([], branches.map(b => b.rows[k].cells))); branches.forEach(b => { b.rows[k].scale = sc; }); }
+  });
+  return { page: { id: pg.id, tag: pg.tag, title: pg.title }, dates, branches, allRows: p.total };
+}
+function slaTableHTML(d) {
+  const n = d.dates.length;
+  let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm" rowspan="2">Branch</th><th class="nm" rowspan="2"></th><th colspan="' + n + '">Date &ndash; ' + esc(d.page.tag) + '</th></tr><tr>' +
+    d.dates.map(iso => '<th>' + esc(slaDayLabel(iso)) + '</th>').join('') + '</tr></thead><tbody>';
+  d.branches.forEach(b => b.rows.forEach((r, k) => {
+    h += '<tr>' + (k === 0 ? '<td class="nm" rowspan="' + b.rows.length + '">' + esc(b.label) + '</td>' : '') + '<td class="nm">' + esc(r.label) + '</td>' +
+      r.cells.map(v => { const bg = slaBg(v, r.scale); return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + esc(slaFmt(r.ci, v)) + '</td>'; }).join('') + '</tr>';
+  }));
   return h + '</tbody></table></div>';
 }
 function renderSla() {
   const host = $('#results');
-  const d = computeSla();
-  if (!d) { host.innerHTML = '<div class="panel"><div class="empty"><b>No SLA/FASR/OFD data yet</b>Drop the raw daily CSV/XLSX (it usually covers about a month; the whole file is used).</div></div>'; return; }
+  const f = slaFile();
+  if (!f) { host.innerHTML = '<div class="panel"><div class="empty"><b>No SLA/FASR/OFD data yet</b>Drop the raw daily CSV/XLSX. Only Shalimar Bagh, Sant Nagar, Paharganj and Dayal Bagh (DEST WAREHOUSE) are used, for the latest ' + SLA_WINDOW + ' dates.</div></div>'; return; }
   const anyShare = canShareFiles();
-  let html = '<div class="bar">' +
-    '<button class="btn primary" id="pubBtn" title="Update your shared link with these tables">Publish to link</button>' +
-    '<button class="btn" id="dlSlaImg">Save image</button><button class="btn" id="cpSlaImg">Copy image</button>' +
-    (anyShare ? '<button class="btn" id="shSlaImg">Share&hellip;</button>' : '') +
-    '<span class="sp"></span><label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add date on images</label></div>';
-  html += '<section class="panel" aria-label="Daily SLA / FASR / OFD table"><div class="phead"><h2>Daily SLA / FASR / OFD<span class="meta">' + d.rows.length + ' day' + (d.rows.length === 1 ? '' : 's') + ' &middot; ' + fmtInt(d.allRows) + ' AWB</span></h2></div>' + slaTableHTML(d) + '</section>';
+  let html = '';
+  SLA_PAGES.forEach((pg, i) => {
+    const d = computeSla(pg.id);
+    html += '<div class="bar">' + (i === 0 ? '<button class="btn primary" id="pubBtn" title="Update your shared link with these tables">Publish to link</button>' : '') +
+      '<button class="btn" data-sla="save:' + pg.id + '">Save image</button><button class="btn" data-sla="copy:' + pg.id + '">Copy image</button>' +
+      (anyShare ? '<button class="btn" data-sla="share:' + pg.id + '">Share&hellip;</button>' : '') +
+      (i === 0 ? '<button class="btn" data-sla="both:">Save both images</button>' : '') +
+      '<span class="sp"></span>' + (i === 0 ? '<label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add date on images</label>' : '') + '</div>';
+    html += '<section class="panel" aria-label="' + esc(pg.title) + '"><div class="phead"><h2>' + esc(pg.title) + '<span class="meta">' + d.dates.length + ' day' + (d.dates.length === 1 ? '' : 's') + ' &middot; ' + fmtInt(d.allRows) + ' AWB in the four branches' + (f.sla.other ? ' &middot; ' + fmtInt(f.sla.other) + ' other-warehouse rows ignored' : '') + '</span></h2></div>' + slaTableHTML(d) + '</section>';
+  });
   host.innerHTML = html;
   $('#pubBtn').onclick = startPublish;
-  $('#dlSlaImg').onclick = saveSlaImage;
-  $('#cpSlaImg').onclick = copySlaImage;
-  if ($('#shSlaImg')) $('#shSlaImg').onclick = shareSlaImage;
+  [].slice.call(host.querySelectorAll('[data-sla]')).forEach(b => {
+    b.onclick = () => { const [act, pid] = b.dataset.sla.split(':'); if (act === 'save') saveSlaImage(pid); else if (act === 'copy') copySlaImage(pid); else if (act === 'share') shareSlaImage(pid); else saveAllSlaImages(); };
+  });
   $('#optTitle').onchange = e => { state.showTitle = e.target.checked; };
 }
 
 /* ---- image ---- */
 function drawSla(d, withTitle) {
-  const S = 3, pad = 14, rowH = 27, headH = 44;
-  const mc = document.createElement('canvas').getContext('2d'); mc.font = 'bold 13px Arial, Helvetica, sans-serif';
-  let w0 = 96; d.rows.forEach(r => { w0 = Math.max(w0, Math.ceil(mc.measureText(fmtDateLong(r.iso)).width) + 20); });
-  const tableW = w0 + SLA_COL_W.reduce((a, b) => a + b, 0), W = tableW + pad * 2;
-  const H = pad * 2 + (withTitle ? 30 : 0) + headH + rowH * (d.rows.length + 1);
+  const S = 3, pad = 14, rowH = 27, headH = 30;
+  const n = d.dates.length, wb = SLA_W.b, wm = SLA_W.m, wd = SLA_W.d;
+  const nRows = d.branches.reduce((a, b) => a + b.rows.length, 0);
+  const W = wb + wm + wd * n + pad * 2;
+  const H = pad * 2 + (withTitle ? 30 : 0) + headH * 2 + rowH * nRows;
   const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S;
   const ctx = cv.getContext('2d'); ctx.scale(S, S);
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); ctx.textBaseline = 'middle';
   const box = (x, y, w, h, fill) => { if (fill) { ctx.fillStyle = fill; ctx.fillRect(x, y, w, h); } ctx.strokeStyle = '#8A9199'; ctx.lineWidth = 1; ctx.strokeRect(x + .5, y + .5, w - 1, h - 1); };
   let y = pad;
   if (withTitle) {
-    ctx.fillStyle = '#141D26'; ctx.font = 'bold 18px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left'; ctx.fillText('Daily SLA / FASR / OFD', pad, y + 14);
+    ctx.fillStyle = '#141D26'; ctx.font = 'bold 18px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left'; ctx.fillText(d.page.title, pad, y + 14);
     ctx.fillStyle = '#5B6773'; ctx.font = '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'right'; ctx.fillText(stampText(), W - pad, y + 15);
     y += 30;
   }
-  let x = pad; ctx.font = 'bold 12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
-  box(x, y, w0, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('Date', x + w0 / 2, y + headH / 2 + 1); x += w0;
-  SLA_LABELS.slice(1).forEach((l, i) => {
-    const w = SLA_COL_W[i]; box(x, y, w, headH, '#4472C4'); ctx.fillStyle = '#fff';
-    const lines = wrapLines(ctx, l, w - 8), lh = 12, top = y + headH / 2 - (lines.length * lh) / 2 + lh / 2;
-    lines.forEach((ln, j) => ctx.fillText(ln, x + w / 2, top + j * lh)); x += w;
+  ctx.textAlign = 'center'; ctx.font = 'bold 13px Arial, Helvetica, sans-serif';
+  box(pad, y, wb, headH * 2, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('Branch', pad + wb / 2, y + headH + 1);
+  box(pad + wb, y, wm, headH * 2, '#4472C4');
+  box(pad + wb + wm, y, wd * n, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('Date \u2013 ' + d.page.tag, pad + wb + wm + (wd * n) / 2, y + headH / 2 + 1);
+  d.dates.forEach((iso, j) => {
+    const x = pad + wb + wm + j * wd;
+    box(x, y + headH, wd, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText(slaDayLabel(iso), x + wd / 2, y + headH + headH / 2 + 1);
   });
-  y += headH;
-  const row = (label, cells, isGrand) => {
-    let xx = pad; ctx.font = (isGrand ? 'bold ' : '') + '14px Arial, Helvetica, sans-serif';
-    box(xx, y, w0, rowH, isGrand ? '#D9E1F2' : null); ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.fillText(label, xx + w0 / 2, y + rowH / 2 + 1); xx += w0;
-    cells.forEach((v, i) => {
-      const w = SLA_COL_W[i], bg = slaBg(i, v, d.scales, isGrand) || (isGrand ? '#D9E1F2' : null);
-      box(xx, y, w, rowH, bg); ctx.fillStyle = '#000'; ctx.font = 'bold 15px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText(slaFmt(i, v), xx + w / 2, y + rowH / 2 + 1); xx += w;
+  y += headH * 2;
+  d.branches.forEach(b => {
+    const gy = y;
+    b.rows.forEach((r, k) => {
+      let x = pad + wb;
+      box(x, y, wm, rowH, '#D9E1F2'); ctx.fillStyle = '#000'; ctx.font = 'bold 13px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(r.label, x + wm / 2, y + rowH / 2 + 1); x += wm;
+      r.cells.forEach(v => {
+        box(x, y, wd, rowH, slaBg(v, r.scale)); ctx.fillStyle = '#000'; ctx.font = 'bold 14px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText(slaFmt(r.ci, v), x + wd / 2, y + rowH / 2 + 1); x += wd;
+      });
+      y += rowH;
     });
-    y += rowH;
-  };
-  d.rows.forEach(r => row(fmtDateLong(r.iso), r.cells, false));
-  row('Grand Total', d.total.cells, true);
+    box(pad, gy, wb, rowH * b.rows.length, '#fff'); ctx.fillStyle = '#000'; ctx.font = 'bold 14px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(b.label, pad + wb / 2, gy + (rowH * b.rows.length) / 2 + 1);
+    ctx.fillStyle = '#44546A'; ctx.fillRect(pad, y - 1, W - pad * 2, 2);   // line between branches
+  });
   return cv;
 }
-function slaBlob() {
-  const d = computeSla(); if (!d) return Promise.reject(new Error('Nothing to draw'));
+function slaBlob(pageId) {
+  const d = computeSla(pageId); if (!d) return Promise.reject(new Error('Nothing to draw'));
   const cv = drawSla(d, state.showTitle);
   return new Promise((res, rej) => cv.toBlob(b => b ? res(b) : rej(new Error('Image failed')), 'image/png'));
 }
-const slaImgName = () => { const d = computeSla(); return 'SLA_FASR_OFD_' + (d ? d.dates[d.dates.length - 1] : dateSlug()) + '.png'; };
-async function saveSlaImage() { try { saveBlob(await slaBlob(), slaImgName()); toast('Saved ' + slaImgName()); } catch (e) { toast(e.message, true); } }
-async function copySlaImage() {
+const slaImgName = pageId => { const d = computeSla(pageId); return 'SLA_FASR_' + (pageId === 'mat' ? 'MATURED' : 'SAMEDAY') + '_' + (d ? d.dates[d.dates.length - 1] : dateSlug()) + '.png'; };
+async function saveSlaImage(pid) { try { saveBlob(await slaBlob(pid), slaImgName(pid)); toast('Saved ' + slaImgName(pid)); } catch (e) { toast(e.message, true); } }
+async function saveAllSlaImages() { for (const pg of SLA_PAGES) { await saveSlaImage(pg.id); await new Promise(r => setTimeout(r, 350)); } }
+async function copySlaImage(pid) {
   try {
     if (!(navigator.clipboard && window.ClipboardItem)) throw new Error('Copy is not supported here. Use Save image instead.');
-    await navigator.clipboard.write([new ClipboardItem({ 'image/png': slaBlob() })]);
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': slaBlob(pid) })]);
     toast('Image copied. Paste it into WhatsApp.');
   } catch (e) { toast(e.message && /supported/.test(e.message) ? e.message : 'Could not copy. Use Save image instead.', true); }
 }
-async function shareSlaImage() {
+async function shareSlaImage(pid) {
   try {
-    const file = new File([await slaBlob()], slaImgName(), { type: 'image/png' });
-    await navigator.share({ files: [file], title: 'Daily SLA / FASR / OFD' });
+    const file = new File([await slaBlob(pid)], slaImgName(pid), { type: 'image/png' });
+    await navigator.share({ files: [file], title: SLA_PAGES.find(x => x.id === pid).title });
   } catch (e) { if (e.name !== 'AbortError') toast('Sharing was not possible. Use Save image instead.', true); }
 }
 
@@ -4087,7 +4110,7 @@ function buildReportHTML() {
     ds: dsData ? { dates: dsDates, zones: dsData } : null,
     dso: haveDso ? dsoTabs.map(x => ({ file: dsoFileName(x.d, 'png'), d: x.d })) : null,
     fe: haveFe ? feTabs.map(x => ({ file: feFileName(x.d, 'png'), d: x.d })) : null,
-    sla: haveSla ? { file: slaImgName(), d: computeSla() } : null,
+    sla: haveSla ? SLA_PAGES.map(pg => ({ file: slaImgName(pg.id), d: computeSla(pg.id) })) : null,
     ofdp: haveOfdp ? { file: ofdpImgName(), d: computeOfdp(ofdpLastDays(OFDP_WINDOW)) } : null
   };
 
@@ -4097,10 +4120,10 @@ function buildReportHTML() {
     ',COD_LABELS=' + JSON.stringify(COD_LABELS) + ',COD_GROUPS=' + JSON.stringify(COD_GROUPS) + ',COD_COL_W=' + JSON.stringify(COD_COL_W) +
     ',DS_LABELS=' + JSON.stringify(DS_LABELS) + ',DS_PCT=' + JSON.stringify(DS_PCT) +
     ',DSO_HEAD=' + JSON.stringify(DSO_HEAD) + ',DSO_PCTV=' + JSON.stringify(DSO_PCTV) + ',DSO_COL_W=' + JSON.stringify(DSO_COL_W) +
-    ',SLA_LABELS=' + JSON.stringify(SLA_LABELS) + ',SLA_PCT=' + JSON.stringify(SLA_PCT) + ',SLA_COL_W=' + JSON.stringify(SLA_COL_W) + ';' +
+    ',SLA_W=' + JSON.stringify(SLA_W) + ';' +
     'const MON=' + JSON.stringify(MON) + ';const fmtInt=' + fmtInt + ';const fmtPct=' + fmtPct + ';const fmtDateLong=' + fmtDateLong + ';' +
     'var DATA=' + jsonForScript(runtimeData) + ';const stampText=function(){return DATA.stamp};\n' +
-    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso, feFmt, drawFe, slaScale, slaFmt, slaBg, drawSla, ofdpPct, drawOfdp].join('\n');
+    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso, feFmt, drawFe, slaScale, slaFmt, slaDayLabel, slaBg, drawSla, ofdpPct, drawOfdp].join('\n');
 
   const uiSrc = '(function(){' +
     'var rt=[].slice.call(document.querySelectorAll("[data-rtab]")),rs=[].slice.call(document.querySelectorAll(".rsec"));' +
@@ -4122,8 +4145,8 @@ function buildReportHTML() {
     '[].slice.call(document.querySelectorAll("[data-dimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.dimg;dsoBlobAt(i).then(function(bl){saveAs(bl,DATA.dso[i].file)})}});' +
     'function feBlobAt(i){var c=DATA.fe[i];var cv=drawFe(c.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-feimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.feimg;feBlobAt(i).then(function(bl){saveAs(bl,DATA.fe[i].file)})}});' +
-    'function slaBlobStatic(){var cv=drawSla(DATA.sla.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
-    '[].slice.call(document.querySelectorAll("[data-slaimg]")).forEach(function(b){b.onclick=function(){slaBlobStatic().then(function(bl){saveAs(bl,DATA.sla.file)})}});' +
+    'function slaBlobAt(i){var cv=drawSla(DATA.sla[i].d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
+    '[].slice.call(document.querySelectorAll("[data-slaimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.slaimg;slaBlobAt(i).then(function(bl){saveAs(bl,DATA.sla[i].file)})}});' +
     'function ofdpBlobStatic(){var cv=drawOfdp(DATA.ofdp.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-ofdpimg]")).forEach(function(b){b.onclick=function(){ofdpBlobStatic().then(function(bl){saveAs(bl,DATA.ofdp.file)})}});' +
     '})();';
@@ -4199,8 +4222,11 @@ function buildReportHTML() {
     body += '</div>';
   }
   if (haveSla) {
-    const d = computeSla();
-    body += '<div class="rsec" id="r-sla"' + (rtabs.length > 1 ? ' hidden' : '') + '><section class="panel"><div class="ph"><h2>Daily SLA / FASR / OFD</h2><button type="button" data-slaimg>Save as image</button></div>' + slaTableHTML(d, { static: true }) + '</section></div>';
+    body += '<div class="rsec" id="r-sla"' + (rtabs.length > 1 ? ' hidden' : '') + '>';
+    SLA_PAGES.forEach((pg, i) => {
+      body += '<section class="panel"><div class="ph"><h2>' + esc(pg.title) + '</h2><button type="button" data-slaimg="' + i + '">Save as image</button></div>' + slaTableHTML(computeSla(pg.id)) + '</section>';
+    });
+    body += '</div>';
   }
   if (haveOfdp) {
     const d = computeOfdp(ofdpLastDays(OFDP_WINDOW));
