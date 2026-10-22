@@ -913,19 +913,16 @@ function parseSlaRows(rows, head) {
     dest: col('DEST WAREHOUSE') };
   const S = v => (v == null ? '' : String(v).trim());
   const branches = SLA_BRANCHES.map(b => ({ key: b.key, label: b.label, days: new Map(), total: 0 }));
-  const allDates = new Set();
-  let total = 0, other = 0;
+  const all = { days: new Map() };                // every row, whatever the DEST WAREHOUSE: feeds the Total block
+  const branchDates = new Set();
+  let total = 0, totalAll = 0, other = 0;
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r]; if (!row || !row.length) continue;
     const radMs = slaParseTS(row[C.rad]); if (radMs == null) continue;    // every metric is keyed off RAD (reached-hub) being present
     const dk = bkey(S(row[C.dest]));
-    const br = branches.find(x => dk.indexOf(x.key) === 0);
-    if (!br) { other++; continue; }                                         // not one of the four branches
-    total++; br.total++;
+    const br = branches.find(x => dk.indexOf(x.key) === 0);               // null = not one of the four branches
+    totalAll++;
     const radDate = slaDateOnly(radMs), iso = slaDateSlug(radDate);
-    allDates.add(iso);
-    let day = br.days.get(iso); if (!day) { day = slaBlank(); br.days.set(iso, day); }
-
     const att1Ms = slaParseTS(row[C.att1]);
     const att1Date = att1Ms == null ? null : slaDateOnly(att1Ms);
     const diffIsNA = att1Date == null;
@@ -935,30 +932,36 @@ function parseSlaRows(rows, head) {
     const fasr = (diffIsNA || delDate == null) ? null : Math.round((delDate - att1Date) / 86400000);
     const pay = S(row[C.pay]);
     const otpMs = slaParseTS(row[C.otp]), cancMs = slaParseTS(row[C.canc]), ofdMs = slaParseTS(row[C.ofd]);
-
-    const a = day;
-    a.total++;
-    if (diff === 0) a.slaNew++;
-    if (!diffIsNA) {
-      a.slaOldNum++;
-      if (pay === 'PREPAID') { a.ppdMatDen++; if (fasr === 0) a.ppdMatNum++; }
-      if (pay === 'COD') { a.codMatDen++; if (fasr === 0) a.codMatNum++; }
-      if (otpMs != null || cancMs != null) a.dvMatNum++;
-    }
-    if (diff === 0) {
-      if (pay === 'PREPAID') { a.ppdSdDen++; if (fasr === 0) a.ppdSdNum++; }
-      if (pay === 'COD') { a.codSdDen++; if (fasr === 0) a.codSdNum++; }
-      a.dvSdDen++;
-      if ((otpMs != null && slaDateOnly(otpMs) === radDate) || (cancMs != null && slaDateOnly(cancMs) === radDate)) a.dvSdNum++;
-    }
-    if (ofdMs != null) {
-      const sec = slaSecOfDay(ofdMs);
-      if (sec < 30600) a.ofd830++;      // 8*3600+30*60
-      if (sec < 34200) a.ofd930++;      // 9*3600+30*60
-    }
+    const bump = a => {
+      a.total++;
+      if (diff === 0) a.slaNew++;
+      if (!diffIsNA) {
+        a.slaOldNum++;
+        if (pay === 'PREPAID') { a.ppdMatDen++; if (fasr === 0) a.ppdMatNum++; }
+        if (pay === 'COD') { a.codMatDen++; if (fasr === 0) a.codMatNum++; }
+        if (otpMs != null || cancMs != null) a.dvMatNum++;
+      }
+      if (diff === 0) {
+        if (pay === 'PREPAID') { a.ppdSdDen++; if (fasr === 0) a.ppdSdNum++; }
+        if (pay === 'COD') { a.codSdDen++; if (fasr === 0) a.codSdNum++; }
+        a.dvSdDen++;
+        if ((otpMs != null && slaDateOnly(otpMs) === radDate) || (cancMs != null && slaDateOnly(cancMs) === radDate)) a.dvSdNum++;
+      }
+      if (ofdMs != null) {
+        const sec = slaSecOfDay(ofdMs);
+        if (sec < 30600) a.ofd830++;      // 8*3600+30*60
+        if (sec < 34200) a.ofd930++;      // 9*3600+30*60
+      }
+    };
+    let dayAll = all.days.get(iso); if (!dayAll) { dayAll = slaBlank(); all.days.set(iso, dayAll); }
+    bump(dayAll);
+    if (!br) { other++; continue; }
+    total++; br.total++; branchDates.add(iso);
+    let day = br.days.get(iso); if (!day) { day = slaBlank(); br.days.set(iso, day); }
+    bump(day);
   }
   if (!total) throw new Error('No rows for Shalimar Bagh, Sant Nagar, Paharganj or Dayal Bagh (DEST WAREHOUSE) with a REACHED_HUB_TIMESTAMP date were found.');
-  return { kind: 'sla', branches, total, other, dates: Array.from(allDates).sort(), rows: total };
+  return { kind: 'sla', branches, all, total, totalAll, other, dates: Array.from(branchDates).sort(), rows: total };
 }
 function slaMetrics(a) {
   return [a.total,
@@ -3516,12 +3519,13 @@ async function downloadFeExcel() {
    DAILY SLA / FASR / OFD REPORT  (Summary only — no history, no Excel; each file
    already covers a full rolling month and fully replaces the one before it)
    ========================================================================== */
-// Two pages, one image each: same-day numbers and matured numbers. Rows are branch -> metric, columns are the latest dates.
+// Two pages, one image each: same-day numbers and matured numbers. Rows are metric blocks (SLA, PPD FASR, COD FASR,
+// Del+VC, Load), each listing the four branches, then a Total block over every row whatever the DEST WAREHOUSE.
 const SLA_PAGES = [
-  { id: 'same', tag: 'Same day', title: 'Daily SLA / FASR \u2013 Same day', cols: [0, 1, 2, 3, 4], labels: ['Total AWB', 'SLA', 'PPD FASR', 'COD FASR', 'Del+VC'] },
-  { id: 'mat', tag: 'Matured', title: 'Daily SLA / FASR \u2013 Matured', cols: [0, 7, 8, 9, 10], labels: ['Total AWB', 'SLA Matured', 'PPD FASR Matured', 'COD FASR Matured', 'Del+VC Matured'] }
+  { id: 'same', tag: 'Same day', title: 'Daily SLA / FASR \u2013 Same day', cols: [1, 2, 3, 4, 0], labels: ['SLA', 'PPD FASR', 'COD FASR', 'Del+VC', 'Load'] },
+  { id: 'mat', tag: 'Matured', title: 'Daily SLA / FASR \u2013 Matured', cols: [7, 8, 9, 10, 0], labels: ['SLA Matured', 'PPD FASR Matured', 'COD FASR Matured', 'Del+VC Matured', 'Load'] }
 ];
-const SLA_W = { b: 118, m: 158, d: 60 };   // image column widths: branch, metric, each date
+const SLA_W = { b: 140, m: 128, d: 60 };   // image column widths: metric block, branch, each date
 const slaFile = () => state.files.find(f => f.kind === 'sla' && f.sla);
 function slaScale(vals) {
   const v = vals.filter(x => x != null).sort((a, b) => a - b);
@@ -3536,24 +3540,26 @@ function computeSla(pageId) {
   const f = slaFile(); if (!f) return null;
   const p = f.sla, pg = SLA_PAGES.find(x => x.id === pageId) || SLA_PAGES[0];
   const dates = p.dates.slice(-SLA_WINDOW);
-  const branches = p.branches.map(b => {
-    const m = dates.map(iso => { const a = b.days.get(iso); return a ? slaMetrics(a) : null; });
-    return { label: b.label, rows: pg.cols.map((ci, k) => ({ label: pg.labels[k], ci, cells: m.map(x => (x ? x[ci] : null)) })) };
+  const metrics = days => dates.map(iso => { const a = days.get(iso); return a ? slaMetrics(a) : null; });
+  const bm = p.branches.map(b => ({ label: b.label, m: metrics(b.days) }));
+  const tm = metrics(p.all.days);
+  const blocks = pg.cols.map((ci, k) => ({ label: pg.labels[k], rows: bm.map(b => ({ label: b.label, ci, cells: b.m.map(x => (x ? x[ci] : null)) })) }));
+  const totalBlock = { label: 'Total', total: true, rows: pg.cols.map((ci, k) => ({ label: pg.labels[k], ci, cells: tm.map(x => (x ? x[ci] : null)) })) };
+  // Heat colours: each % metric is scaled across its four branches, all dates and the Total row, so branches are
+  // comparable; Load is scaled along each row (branches and the total differ a lot in size).
+  blocks.forEach((bl, k) => {
+    const ci = bl.rows[0].ci, tr = totalBlock.rows[k];
+    if (ci === 0) { bl.rows.forEach(r => { r.scale = slaScale(r.cells); }); tr.scale = slaScale(tr.cells); }
+    else { const sc = slaScale([].concat.apply([], bl.rows.map(r => r.cells)).concat(tr.cells)); bl.rows.forEach(r => { r.scale = sc; }); tr.scale = sc; }
   });
-  // Heat colours: Total AWB is scaled along its own branch row (branches differ in size); every % metric is scaled
-  // across all branches and dates so the same metric is comparable between branches.
-  pg.cols.forEach((ci, k) => {
-    if (ci === 0) branches.forEach(b => { b.rows[k].scale = slaScale(b.rows[k].cells); });
-    else { const sc = slaScale([].concat.apply([], branches.map(b => b.rows[k].cells))); branches.forEach(b => { b.rows[k].scale = sc; }); }
-  });
-  return { page: { id: pg.id, tag: pg.tag, title: pg.title }, dates, branches, allRows: p.total };
+  return { page: { id: pg.id, tag: pg.tag, title: pg.title }, dates, blocks: blocks.concat([totalBlock]), allRows: p.total, totalRows: p.totalAll };
 }
 function slaTableHTML(d) {
   const n = d.dates.length;
-  let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm" rowspan="2">Branch</th><th class="nm" rowspan="2"></th><th colspan="' + n + '">Date &ndash; ' + esc(d.page.tag) + '</th></tr><tr>' +
+  let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm" rowspan="2">Metric</th><th class="nm" rowspan="2">Branch</th><th colspan="' + n + '">Date &ndash; ' + esc(d.page.tag) + '</th></tr><tr>' +
     d.dates.map(iso => '<th>' + esc(slaDayLabel(iso)) + '</th>').join('') + '</tr></thead><tbody>';
-  d.branches.forEach(b => b.rows.forEach((r, k) => {
-    h += '<tr>' + (k === 0 ? '<td class="nm" rowspan="' + b.rows.length + '">' + esc(b.label) + '</td>' : '') + '<td class="nm">' + esc(r.label) + '</td>' +
+  d.blocks.forEach(bl => bl.rows.forEach((r, k) => {
+    h += '<tr' + (bl.total ? ' class="tot"' : '') + '>' + (k === 0 ? '<td class="nm" rowspan="' + bl.rows.length + '">' + esc(bl.label) + '</td>' : '') + '<td class="nm">' + esc(r.label) + '</td>' +
       r.cells.map(v => { const bg = slaBg(v, r.scale); return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + esc(slaFmt(r.ci, v)) + '</td>'; }).join('') + '</tr>';
   }));
   return h + '</tbody></table></div>';
@@ -3571,7 +3577,7 @@ function renderSla() {
       (anyShare ? '<button class="btn" data-sla="share:' + pg.id + '">Share&hellip;</button>' : '') +
       (i === 0 ? '<button class="btn" data-sla="both:">Save both images</button>' : '') +
       '<span class="sp"></span>' + (i === 0 ? '<label class="chk"><input type="checkbox" id="optTitle"' + (state.showTitle ? ' checked' : '') + '> Add date on images</label>' : '') + '</div>';
-    html += '<section class="panel" aria-label="' + esc(pg.title) + '"><div class="phead"><h2>' + esc(pg.title) + '<span class="meta">' + d.dates.length + ' day' + (d.dates.length === 1 ? '' : 's') + ' &middot; ' + fmtInt(d.allRows) + ' AWB in the four branches' + (f.sla.other ? ' &middot; ' + fmtInt(f.sla.other) + ' other-warehouse rows ignored' : '') + '</span></h2></div>' + slaTableHTML(d) + '</section>';
+    html += '<section class="panel" aria-label="' + esc(pg.title) + '"><div class="phead"><h2>' + esc(pg.title) + '<span class="meta">' + d.dates.length + ' day' + (d.dates.length === 1 ? '' : 's') + ' &middot; ' + fmtInt(d.allRows) + ' AWB in the four branches &middot; Total row uses all ' + fmtInt(d.totalRows) + ' AWB' + '</span></h2></div>' + slaTableHTML(d) + '</section>';
   });
   host.innerHTML = html;
   $('#pubBtn').onclick = startPublish;
@@ -3585,7 +3591,7 @@ function renderSla() {
 function drawSla(d, withTitle) {
   const S = 3, pad = 14, rowH = 27, headH = 30;
   const n = d.dates.length, wb = SLA_W.b, wm = SLA_W.m, wd = SLA_W.d;
-  const nRows = d.branches.reduce((a, b) => a + b.rows.length, 0);
+  const nRows = d.blocks.reduce((a, b) => a + b.rows.length, 0);
   const W = wb + wm + wd * n + pad * 2;
   const H = pad * 2 + (withTitle ? 30 : 0) + headH * 2 + rowH * nRows;
   const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S;
@@ -3599,17 +3605,17 @@ function drawSla(d, withTitle) {
     y += 30;
   }
   ctx.textAlign = 'center'; ctx.font = 'bold 13px Arial, Helvetica, sans-serif';
-  box(pad, y, wb, headH * 2, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('Branch', pad + wb / 2, y + headH + 1);
-  box(pad + wb, y, wm, headH * 2, '#4472C4');
+  box(pad, y, wb, headH * 2, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('Metric', pad + wb / 2, y + headH + 1);
+  box(pad + wb, y, wm, headH * 2, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('Branch', pad + wb + wm / 2, y + headH + 1);
   box(pad + wb + wm, y, wd * n, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('Date \u2013 ' + d.page.tag, pad + wb + wm + (wd * n) / 2, y + headH / 2 + 1);
   d.dates.forEach((iso, j) => {
     const x = pad + wb + wm + j * wd;
     box(x, y + headH, wd, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText(slaDayLabel(iso), x + wd / 2, y + headH + headH / 2 + 1);
   });
   y += headH * 2;
-  d.branches.forEach(b => {
+  d.blocks.forEach(bl => {
     const gy = y;
-    b.rows.forEach((r, k) => {
+    bl.rows.forEach(r => {
       let x = pad + wb;
       box(x, y, wm, rowH, '#D9E1F2'); ctx.fillStyle = '#000'; ctx.font = 'bold 13px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
       ctx.fillText(r.label, x + wm / 2, y + rowH / 2 + 1); x += wm;
@@ -3619,9 +3625,9 @@ function drawSla(d, withTitle) {
       });
       y += rowH;
     });
-    box(pad, gy, wb, rowH * b.rows.length, '#fff'); ctx.fillStyle = '#000'; ctx.font = 'bold 14px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText(b.label, pad + wb / 2, gy + (rowH * b.rows.length) / 2 + 1);
-    ctx.fillStyle = '#44546A'; ctx.fillRect(pad, y - 1, W - pad * 2, 2);   // line between branches
+    box(pad, gy, wb, rowH * bl.rows.length, bl.total ? '#D9E1F2' : '#fff'); ctx.fillStyle = '#000'; ctx.font = 'bold 14px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(bl.label, pad + wb / 2, gy + (rowH * bl.rows.length) / 2 + 1);
+    ctx.fillStyle = '#44546A'; ctx.fillRect(pad, y - 1, W - pad * 2, 2);   // line between blocks
   });
   return cv;
 }
