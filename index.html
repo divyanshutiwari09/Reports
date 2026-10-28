@@ -310,6 +310,13 @@ const DS_ZONE_KEY = { 'Delhi NCR': 'delhi', 'Mumbai': 'mumbai', 'Zone B': 'zoneb
 const DS_ZONEB_RE = /agra|amritsar|dehradun|jalandhar|kanpur|lucknow|meerut/i;
 const DS_MUMBAI_RE = /andheri|borivali|belapur|chinchpokli|girgaon|kurla|malad|sanpada|santacruz|thane|vasai|vikhroli/i;
 const DS_LABELS = ['TOTAL COUNT', 'IN TAT SLA', 'SAME DAY SLA', 'FASR', 'DEL+VC'];
+/* ---- Mumbai DS Performance, new format: one row per EDD date, Overall (all phases) and SDD (Phase 1) side by side ---- */
+const DSM_REQUIRED = ['PICKED UP TIME', 'DELIVERY PINCODE', 'PAYMENT MODE'];
+// delivery pincode -> phase, from SDD_MUMBAI_SHIPROCKET_29-Sep-26.xlsx (Phase 1 = same-day SDD, Phase 2/3 = next day)
+const DSM_PHASE = {"400096":2,"400099":1,"400069":1,"400060":3,"400059":3,"400093":1,"400058":2,"401101":3,"400068":2,"401107":2,"400614":2,"410209":3,"410218":3,"400706":2,"410210":3,"400012":1,"400013":3,"400011":1,"400010":2,"400025":3,"400033":1,"400031":2,"400014":2,"400015":3,"400027":1,"400004":1,"400009":1,"400002":2,"400003":2,"400007":1,"400034":1,"400006":1,"400026":3,"400036":1,"400023":3,"400032":3,"400039":3,"400038":3,"400074":3,"400085":3,"400075":3,"400089":2,"400088":3,"400077":3,"400019":3,"400024":1,"400070":2,"400094":3,"400022":2,"400062":2,"400090":2,"400104":1,"400064":1,"400101":3,"400097":2,"400067":1,"400710":2,"400703":1,"400705":3,"400708":3,"400701":3,"400709":1,"400055":1,"400051":3,"400050":2,"400054":1,"400052":1,"400057":1,"400056":1,"400049":1,"400098":2,"400029":2,"400602":1,"400603":1,"400608":1,"400081":1,"400606":1,"400605":2,"400610":1,"400604":1,"400601":1,"400615":1,"400607":1,"400078":3,"400080":3,"400086":3,"400083":1,"400076":2,"400042":2,"400079":1,"400084":3,"400082":3};
+const DSM_LABELS = ['Total Load', 'SLA', 'PPD FASR', 'COD FASR', 'Del+VC'];
+const DSM_WINDOW = 10;     // dates shown in the image and on screen
+const DSM_HKEY = 'dsmHistory';
 const DS_PCT = [1, 2, 3, 4];
 const DS_COL_W = [72, 68, 78, 60, 64];
 const DSO_EXTRA = ['STATUS', 'PACKED', 'OFD', 'ATTEMPT COMPLIANCE', 'EDD TIME'];
@@ -749,6 +756,77 @@ function parseDsRows(rows, head) {
   return { kind: 'ds', date: reportDateMs != null ? dsDateSlug(reportDateMs) : null, franchises, rows: total, excluded };
 }
 
+/* ---- Mumbai DS Performance (new format). The system EDD is not used: EDD is rebuilt from PICKED UP TIME and the pincode's phase.
+   Phase 1 (SDD): pickup up to 12:00 -> same day, after 12:00 -> next day.
+   Phase 2/3:     pickup before 19:00 -> pickup date + 1, from 19:00 -> pickup date + 2.
+   SLA = first attempt on or before the EDD date; PPD/COD FASR and Del+VC are measured on those on-time attempted orders. ---- */
+function dsmBlank() { return { total: 0, ok: 0, ppdDen: 0, ppdNum: 0, codDen: 0, codNum: 0, vc: 0 }; }
+function parseDsMumbaiRows(rows, head) {
+  const col = n => head.indexOf(n.toLowerCase());
+  const C = { awb: col('AWB NO'), fr: col('FRANCHISEE'), pick: col('PICKED UP TIME'), pin: col('DELIVERY PINCODE'), pay: col('PAYMENT MODE'),
+    fa: col('FIRST ATTEMPT'), faDate: col('FIRST ATTEMPT DATE'), deliv: col('DELIVERED'), undel: col('UNDELIVERED TYPE'),
+    edd: col('EDD DATE'), ord: col('CALCULATED ORDER DATE') };
+  const S = v => (v == null ? '' : String(v).trim());
+  // a Mumbai file is one whose franchisees are all Mumbai hubs; anything else goes down the normal DS route
+  let seen = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    const n = S(row[C.fr]); if (!n) continue;
+    seen++; if (!DS_MUMBAI_RE.test(n)) return null;
+  }
+  if (!seen) return null;
+  // The spreadsheet library can hand back date cells a few seconds off in some time zones (in India they arrive 10 s early). The
+  // date-only columns are exact midnights, so they show how far off the reading is; undo that for the pickup time, because a
+  // pickup at 19:00:00 must not be read as 18:59:50 (it would get the wrong EDD).
+  let shift = 0;
+  [C.edd, C.ord].forEach(ci => {
+    if (shift || ci < 0) return;
+    const seenSec = [];
+    for (let r = 1; r < rows.length && seenSec.length < 40; r++) {
+      const v = rows[r] && rows[r][ci];
+      if (v instanceof Date && !isNaN(v.getTime())) { let sec = v.getHours() * 3600 + v.getMinutes() * 60 + v.getSeconds() + v.getMilliseconds() / 1000; if (sec > 43200) sec -= 86400; seenSec.push(sec); }
+    }
+    if (seenSec.length) { seenSec.sort((a, b) => a - b); const med = seenSec[seenSec.length >> 1]; if (Math.abs(med) <= 900) shift = med; }
+  });
+  const pickTime = v => {
+    if (v instanceof Date) { if (isNaN(v.getTime())) return null; return Math.round((Date.UTC(v.getFullYear(), v.getMonth(), v.getDate(), v.getHours(), v.getMinutes(), v.getSeconds()) + v.getMilliseconds() - shift * 1000) / 1000) * 1000; }
+    return slaParseTS(v);
+  };
+  const days = {}, unmapped = {};
+  let total = 0, excluded = 0, noPickup = 0, unmappedN = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; if (!row || !row.length) continue;
+    total++;
+    if (!S(row[C.awb])) { excluded++; continue; }
+    const pickMs = pickTime(row[C.pick]);
+    if (pickMs == null) { noPickup++; continue; }                          // no pickup time, so no EDD can be made
+    const pin = S(row[C.pin]).replace(/\.0+$/, '');
+    const ph = DSM_PHASE[pin] || 0;
+    if (!ph) { unmappedN++; unmapped[pin || '(blank)'] = (unmapped[pin || '(blank)'] || 0) + 1; }   // not in the phase sheet: treated as next-day, Overall only
+    const sec = slaSecOfDay(pickMs), day0 = slaDateOnly(pickMs);
+    const add = ph === 1 ? (sec <= 43200 ? 0 : 1) : (sec < 68400 ? 1 : 2);
+    const eddMs = day0 + add * 86400000, iso = slaDateSlug(eddMs);
+    const faMs = S(row[C.fa]) === 'Yes' ? codParseDate(row[C.faDate]) : null;
+    const ok = faMs != null && faMs <= eddMs;                              // attempted on or before the EDD date
+    const pay = S(row[C.pay]).toUpperCase().replace(/[^A-Z]/g, '');
+    const dv = S(row[C.deliv]);
+    const delivered = dv === 'Yes';
+    const vc = delivered || (dv === 'No' && S(row[C.undel]) === 'Verified');
+    let day = days[iso]; if (!day) { day = { all: dsmBlank(), sdd: dsmBlank() }; days[iso] = day; }
+    const bump = a => {
+      a.total++;
+      if (!ok) return;
+      a.ok++;
+      if (pay === 'PREPAID') { a.ppdDen++; if (delivered) a.ppdNum++; }
+      if (pay === 'COD') { a.codDen++; if (delivered) a.codNum++; }
+      if (vc) a.vc++;
+    };
+    bump(day.all);
+    if (ph === 1) bump(day.sdd);
+  }
+  return { kind: 'dsm', days, dates: Object.keys(days).sort(), rows: total, excluded, noPickup, unmapped, unmappedN };
+}
+
 /* ---- DS OFD (same raw file as DS Performance; a live snapshot for 12pm / 3pm / 6pm sends) ---- */
 function dsoStamp(name) {
   // the download date and time come from the raw file's own name, e.g. ..._2026-09-26T18_02_08_..._05_30.xlsx
@@ -1160,6 +1238,7 @@ function parseAny(buf, name) {
   if (!mp.length) return parsePerfRows(rows, head);
   if (!mo.length) return parseOfdRows(rows, head);
   if (!md.length) {
+    if (!missing(DSM_REQUIRED).length) { const m = parseDsMumbaiRows(rows, head); if (m) return m; }   // Mumbai-only file -> new Mumbai format
     const r = parseDsRows(rows, head);
     if (!missing(DSO_EXTRA).length) r.ofd = parseDsOfdRows(rows, head, dsoStamp(name));
     return r;
@@ -1179,11 +1258,11 @@ function getWorkerURL() {
   const lib = document.getElementById('xlsx-src').textContent;
   const code = lib + '\n;const OFD_REQUIRED=' + JSON.stringify(OFD_REQUIRED) + ',PERF_REQUIRED=' + JSON.stringify(PERF_REQUIRED) +
     ',PERF_DROP=' + JSON.stringify(PERF_DROP) + ',COD_REQUIRED=' + JSON.stringify(COD_REQUIRED) + ',COD_NEEDED=' + JSON.stringify(COD_NEEDED) +
-    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) + ',SLA_REQUIRED=' + JSON.stringify(SLA_REQUIRED) + ',SLA_BRANCHES=' + JSON.stringify(SLA_BRANCHES) + ',OFDP_REQUIRED=' + JSON.stringify(OFDP_REQUIRED) +
+    ',DS_REQUIRED=' + JSON.stringify(DS_REQUIRED) + ',DSO_EXTRA=' + JSON.stringify(DSO_EXTRA) + ',FE_REQUIRED=' + JSON.stringify(FE_REQUIRED) + ',SLA_REQUIRED=' + JSON.stringify(SLA_REQUIRED) + ',SLA_BRANCHES=' + JSON.stringify(SLA_BRANCHES) + ',DSM_REQUIRED=' + JSON.stringify(DSM_REQUIRED) + ',DSM_PHASE=' + JSON.stringify(DSM_PHASE) + ',DS_MUMBAI_RE=' + DS_MUMBAI_RE.toString() + ',OFDP_REQUIRED=' + JSON.stringify(OFDP_REQUIRED) +
     ';const bkey=' + bkey + ';const isY=' + isY + ';\n' +
     csvToRows + '\n' + pinNorm + '\n' + pinHub + '\n' + pinHeaderDate + '\n' + parsePinDash + '\n' + parseOfdRows + '\n' + parsePerfRows + '\n' + parseCodRows + '\n' + codParseDate + '\n' + codBucket + '\n' +
     dsoStamp + '\n' + dsoBlank + '\n' + parseDsOfdRows + '\n' + dsBlankAgg + '\n' + dsTimeOfDay + '\n' + feSame + '\n' + parseFeRows + '\n' + parseFeDash +
-    '\n' + slaParseTS + '\n' + slaDateOnly + '\n' + slaSecOfDay + '\n' + slaDateSlug + '\n' + slaBlank + '\n' + parseSlaRows + '\n' + parseOfdPendRows + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + parseAny + '\n' +
+    '\n' + slaParseTS + '\n' + slaDateOnly + '\n' + slaSecOfDay + '\n' + slaDateSlug + '\n' + slaBlank + '\n' + parseSlaRows + '\n' + parseOfdPendRows + '\n' + dsDateSlug + '\n' + parseDsRows + '\n' + dsmBlank + '\n' + parseDsMumbaiRows + '\n' + parseAny + '\n' +
     'self.onmessage=function(e){try{self.postMessage({ok:true,p:parseAny(e.data.buf,e.data.name)});}catch(err){self.postMessage({ok:false,msg:String((err&&err.message)||err)});}};';
   workerURL = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
   return workerURL;
@@ -1267,6 +1346,12 @@ async function processOne(f, rec) {
         toast(f.name + ': orders are for ' + fmtDateLong(p.date) + ' (a finished day), so it went to DS Performance only.');
         if (!state.picked) state.report = 'ds';
       }
+    } else if (p.kind === 'dsm') {
+      // Mumbai-only file: feeds the new Mumbai DS Performance table only (not DS OFD, not the other zones)
+      state.files.filter(x => x !== rec && x.kind === 'dsm').forEach(x => { state.files = state.files.filter(y => y !== x); });
+      rec.dsm = p; rec.rows = p.rows;
+      applyDsmFile();
+      if (!state.picked) state.report = 'ds';
     } else if (p.kind === 'sla') {
       state.files.filter(x => x !== rec && x.kind === 'sla').forEach(x => { state.files = state.files.filter(y => y !== x); });
       rec.sla = p; rec.rows = p.rows;
@@ -1335,7 +1420,7 @@ async function addFiles(fileList) {
   render();
 }
 
-const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() : id === 'dso' ? !!dsoFile() : id === 'fe' ? feHasHistory() : id === 'sla' ? !!slaFile() : id === 'ofdp' ? ofdpHasHistory() : id === 'pin' ? !!pinDashFile() || pinOfdFiles().length > 0 : false;
+const hasData = id => id === 'ofd' ? ZONES.some(z => zoneFile(z)) : id === 'perf' ? !!perfFile() || perfHasHistory() : id === 'cod' ? !!codFile() : id === 'ds' ? !!dsFile() || dsHasHistory() || dsmHasHistory() : id === 'dso' ? !!dsoFile() : id === 'fe' ? feHasHistory() : id === 'sla' ? !!slaFile() : id === 'ofdp' ? ofdpHasHistory() : id === 'pin' ? !!pinDashFile() || pinOfdFiles().length > 0 : false;
 
 
 /* ==========================================================================
@@ -2622,12 +2707,13 @@ function loadDs() {
   try { const savedCh = JSON.parse(lsGet(nsKey(DS_CHKEY)) || 'null'); if (savedCh) dsChoices = savedCh; } catch (e) {}
   try { const savedKn = JSON.parse(lsGet(nsKey(DS_KNKEY)) || 'null'); if (savedKn) dsKnown = savedKn; } catch (e) {}
   dsSeedKnown();
+  loadDsm();
 }
 function saveDsHistory() { lsSet(nsKey(DS_HKEY), JSON.stringify(dsHistory)); }
 function saveDsChoices() { lsSet(nsKey(DS_CHKEY), JSON.stringify(dsChoices)); }
 function saveDsKnown() { lsSet(nsKey(DS_KNKEY), JSON.stringify(dsKnown)); }
 function resetDsHistory() {
-  lsDel(nsKey(DS_HKEY)); lsDel(nsKey(DS_CHKEY)); lsDel(nsKey(DS_KNKEY));
+  lsDel(nsKey(DS_HKEY)); lsDel(nsKey(DS_CHKEY)); lsDel(nsKey(DS_KNKEY)); lsDel(nsKey(DSM_HKEY));
   loadDs(); render(); toast('Saved DS Performance data cleared');
 }
 function dsHasHistory() { return Object.keys(dsHistory.days).length > 0; }
@@ -2639,6 +2725,107 @@ function dsCleanupOldMonth(latestDate) {
   let removed = 0;
   Object.keys(dsHistory.days).forEach(dt => { if (monthOf(dt) < curYM) { delete dsHistory.days[dt]; removed++; } });
   if (removed) { saveDsHistory(); toast('Cleared last month\u2019s DS Performance data (done on the ' + DS_CLEAN_DAY + 'th of each month).'); }
+}
+
+/* ---- Mumbai (new format) history: date -> { all, sdd } counts, kept in this browser like the other DS data ---- */
+let dsmHistory = { days: {} };
+function loadDsm() { dsmHistory = { days: {} }; try { const sv = JSON.parse(lsGet(nsKey(DSM_HKEY)) || 'null'); if (sv && sv.days) dsmHistory = sv; } catch (e) {} }
+function saveDsm() { lsSet(nsKey(DSM_HKEY), JSON.stringify(dsmHistory)); }
+const dsmFile = () => state.files.find(f => f.kind === 'dsm' && f.dsm);
+function dsmHasHistory() { return Object.keys(dsmHistory.days).length > 0; }
+function dsmDoneDates() { const t = todayISO(); return Object.keys(dsmHistory.days).filter(d => d < t).sort(); }   // a day still running is held back until it is over
+function dsmActive() { return dsmDoneDates().length > 0; }
+function applyDsmFile() {
+  const f = dsmFile(); if (!f) return;
+  let kept = 0;
+  f.dsm.dates.forEach(iso => {
+    const nw = f.dsm.days[iso], old = dsmHistory.days[iso];
+    if (old && old.all.total > nw.all.total) { kept++; return; }   // never replace a day with a smaller one (a short file must not shrink it)
+    dsmHistory.days[iso] = nw;
+  });
+  const keys = Object.keys(dsmHistory.days).sort(), latest = keys[keys.length - 1];
+  if (latest && new Date(latest + 'T00:00:00Z').getUTCDate() >= DS_CLEAN_DAY) {   // same monthly clean-up as the other DS data
+    const cur = monthOf(latest); keys.forEach(k => { if (monthOf(k) < cur) delete dsmHistory.days[k]; });
+  }
+  saveDsm();
+  const p = f.dsm, ds = p.dates;
+  let msg = f.name + ': Mumbai loaded, ' + ds.length + ' EDD dates' + (ds.length ? ' (' + fmtDateLong(ds[0]) + ' to ' + fmtDateLong(ds[ds.length - 1]) + ')' : '') + '.';
+  if (p.noPickup) msg += ' ' + p.noPickup + ' orders with no pickup time were left out.';
+  if (p.unmappedN) msg += ' ' + p.unmappedN + ' orders had a pincode that is not in the phase sheet (' + Object.keys(p.unmapped).slice(0, 4).join(', ') + '), counted as next-day in Overall only.';
+  if (kept) msg += ' ' + kept + ' dates kept as they were because this file had fewer orders for them.';
+  toast(msg);
+}
+function dsmMetrics(a) {
+  const dv = (n, d) => (d ? n / d : null);
+  return [a.total, a.total ? a.ok / a.total : null, dv(a.ppdNum, a.ppdDen), dv(a.codNum, a.codDen), dv(a.vc, a.ok)];
+}
+function dsmData(allDates) {
+  const dates = allDates ? dsmDoneDates() : dsmDoneDates().slice(-DSM_WINDOW);
+  const rows = dates.map(iso => { const d = dsmHistory.days[iso]; return { iso, all: dsmMetrics(d.all), sdd: dsmMetrics(d.sdd) }; });
+  const scales = { all: {}, sdd: {} };
+  ['all', 'sdd'].forEach(k => DS_PCT.forEach(c => { scales[k][c] = slaScale(rows.map(r => r[k][c])); }));
+  return { dates, rows, scales };
+}
+function dsmFmt(i, v) { return v == null ? '\u2013' : (i === 0 ? fmtInt(v) : fmtPct(v)); }
+function dsmTableHTML(d) {
+  let h = '<div class="scroller"><table class="grid"><thead><tr><th class="nm" rowspan="2">Date</th><th colspan="5">Overall</th><th colspan="5">SDD</th></tr><tr>' +
+    DSM_LABELS.concat(DSM_LABELS).map(l => '<th>' + esc(l) + '</th>').join('') + '</tr></thead><tbody>';
+  d.rows.forEach(r => {
+    h += '<tr><td class="nm">' + esc(slaDayLabel(r.iso)) + '</td>' + ['all', 'sdd'].map(k => r[k].map((v, i) => {
+      const bg = DS_PCT.includes(i) ? slaBg(v, d.scales[k][i]) : null;
+      return '<td' + (bg ? ' style="background:' + bg + '"' : '') + '>' + esc(dsmFmt(i, v)) + '</td>';
+    }).join('')).join('') + '</tr>';
+  });
+  return h + '</tbody></table></div>';
+}
+function drawDsm(d, withTitle) {
+  const S = 3, pad = 14, rowH = 26, headH = 26, w0 = 86, cw = 70;
+  const W = w0 + cw * 10 + pad * 2, H = pad * 2 + (withTitle ? 30 : 0) + headH * 2 + rowH * d.rows.length;
+  const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S;
+  const ctx = cv.getContext('2d'); ctx.scale(S, S);
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H); ctx.textBaseline = 'middle';
+  const box = (x, y, w, h, fill) => { if (fill) { ctx.fillStyle = fill; ctx.fillRect(x, y, w, h); } ctx.strokeStyle = '#8A9199'; ctx.lineWidth = 1; ctx.strokeRect(x + .5, y + .5, w - 1, h - 1); };
+  let y = pad;
+  if (withTitle) {
+    ctx.fillStyle = '#141D26'; ctx.font = 'bold 18px Arial, Helvetica, sans-serif'; ctx.textAlign = 'left'; ctx.fillText('DS Performance \u2013 Mumbai', pad, y + 14);
+    ctx.fillStyle = '#5B6773'; ctx.font = '12px Arial, Helvetica, sans-serif'; ctx.textAlign = 'right'; ctx.fillText(stampText(), W - pad, y + 15);
+    y += 30;
+  }
+  ctx.textAlign = 'center'; ctx.font = 'bold 13px Arial, Helvetica, sans-serif';
+  box(pad, y, w0, headH * 2, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText('Date', pad + w0 / 2, y + headH + 1);
+  ['Overall', 'SDD'].forEach((t, half) => { const x = pad + w0 + half * cw * 5; box(x, y, cw * 5, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText(t, x + cw * 2.5, y + headH / 2 + 1); });
+  ctx.font = 'bold 12px Arial, Helvetica, sans-serif';
+  DSM_LABELS.concat(DSM_LABELS).forEach((l, i) => { const x = pad + w0 + i * cw; box(x, y + headH, cw, headH, '#4472C4'); ctx.fillStyle = '#fff'; ctx.fillText(l, x + cw / 2, y + headH + headH / 2 + 1); });
+  y += headH * 2;
+  d.rows.forEach(r => {
+    box(pad, y, w0, rowH, '#D9E1F2'); ctx.fillStyle = '#000'; ctx.font = 'bold 13px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center'; ctx.fillText(slaDayLabel(r.iso), pad + w0 / 2, y + rowH / 2 + 1);
+    ['all', 'sdd'].forEach((k, half) => r[k].forEach((v, i) => {
+      const x = pad + w0 + (half * 5 + i) * cw, bg = DS_PCT.includes(i) ? slaBg(v, d.scales[k][i]) : null;
+      box(x, y, cw, rowH, bg); ctx.fillStyle = '#000'; ctx.font = 'bold 14px Arial, Helvetica, sans-serif'; ctx.textAlign = 'center'; ctx.fillText(dsmFmt(i, v), x + cw / 2, y + rowH / 2 + 1);
+    }));
+    y += rowH;
+  });
+  ctx.fillStyle = '#44546A'; ctx.fillRect(pad + w0 + cw * 5 - 1, pad + (withTitle ? 30 : 0) + headH, 2, headH + rowH * d.rows.length);   // line between Overall and SDD
+  return cv;
+}
+function dsmExcelSheet(wb, border) {
+  const ws = wb.addWorksheet('Mumbai', { views: [{ state: 'frozen', xSplit: 1, ySplit: 2 }] });
+  const d = dsmData(true);
+  const fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9E1F2' } };
+  const hdr = (r, c, text) => { const x = ws.getCell(r, c); x.value = text; x.font = { bold: true }; x.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; x.fill = fill; x.border = border; };
+  ws.getColumn(1).width = 14;
+  ws.mergeCells(1, 1, 2, 1); hdr(1, 1, 'Date');
+  ws.mergeCells(1, 2, 1, 6); hdr(1, 2, 'Overall'); ws.mergeCells(1, 7, 1, 11); hdr(1, 7, 'SDD');
+  DSM_LABELS.concat(DSM_LABELS).forEach((l, i) => { hdr(2, 2 + i, l); ws.getColumn(2 + i).width = 12; });
+  d.rows.forEach((r, k) => {
+    const rr = 3 + k, dc = ws.getCell(rr, 1); dc.value = new Date(r.iso + 'T00:00:00Z'); dc.numFmt = 'dd-mmm-yy'; dc.border = border;
+    ['all', 'sdd'].forEach((key, half) => r[key].forEach((v, i) => { const c = ws.getCell(rr, 2 + half * 5 + i); c.value = v == null ? null : v; c.numFmt = DS_PCT.includes(i) ? '0%' : '#,##0'; c.border = border; }));
+  });
+  const last = 2 + d.rows.length;
+  if (last >= 4) [0, 1].forEach(half => DS_PCT.forEach(i => {
+    const L = openpyxlCol(2 + half * 5 + i);
+    ws.addConditionalFormatting({ ref: L + '3:' + L + last, rules: [{ type: 'colorScale', priority: 1, cfvo: [{ type: 'min' }, { type: 'percentile', value: 50 }, { type: 'max' }], color: [{ argb: 'FFF8696B' }, { argb: 'FFFFEB84' }, { argb: 'FF63BE7B' }] }] });
+  }));
 }
 
 function applyDsFile() {
@@ -2754,12 +2941,12 @@ function dsMultiTable(zone, dates, opts) {
   return h;
 }
 
-function dsZoneHasRows(zone, dates) { return dates.some(dt => { const d = dsDay(zone, dt); return d && d.rows.length; }); }
+function dsZoneHasRows(zone, dates) { if (zone === 'Mumbai' && dsmActive()) return true; return dates.some(dt => { const d = dsDay(zone, dt); return d && d.rows.length; }); }
 
 function renderDs() {
   const host = $('#results');
   const dates = dsLastDays(DS_WINDOW);
-  if (!dates.length) { host.innerHTML = '<div class="panel"><div class="empty"><b>No DS Performance data yet</b>Drop today\u2019s raw dark-store export to see the tables.</div></div>'; return; }
+  if (!dates.length && !dsmActive()) { host.innerHTML = '<div class="panel"><div class="empty"><b>No DS Performance data yet</b>Drop today\u2019s raw dark-store export to see the tables.</div></div>'; return; }
   const anyShare = canShareFiles();
   const freshKeys = dsFreshKeys();
   const hiddenKeys = Object.keys(dsChoices).filter(k => dsChoices[k] === 'exclude');
@@ -2787,10 +2974,10 @@ function renderDs() {
 
   html += DS_ZONES.map((zone, zi) => {
     const has = dsZoneHasRows(zone, dates);
-    return '<section class="panel" aria-label="' + esc(zone) + ' table"><div class="phead"><h2>' + esc(zone) + '</h2><div class="pact">' +
+    return '<section class="panel" aria-label="' + esc(zone) + ' table"><div class="phead"><h2>' + esc(zone) + (zone === 'Mumbai' && dsmActive() ? '<span class="meta">EDD from pickup time &middot; latest ' + DSM_WINDOW + ' finished days &middot; SDD = Phase 1</span>' : '') + '</h2><div class="pact">' +
       (has ? '<button class="btn small" data-dssave="' + zi + '">Save image</button><button class="btn small" data-dscopy="' + zi + '">Copy image</button>' +
         (anyShare ? '<button class="btn small" data-dsshare="' + zi + '">Share&hellip;</button>' : '') : '') +
-      '</div></div>' + (has ? dsMultiTable(zone, dates) : '<div class="empty"><b>No ' + esc(zone) + ' data yet</b>None of the dates shown has a ' + esc(zone) + ' dark store in the file.</div>') + '</section>';
+      '</div></div>' + (has ? (zone === 'Mumbai' && dsmActive() ? dsmTableHTML(dsmData()) : dsMultiTable(zone, dates)) : '<div class="empty"><b>No ' + esc(zone) + ' data yet</b>None of the dates shown has a ' + esc(zone) + ' dark store in the file.</div>') + '</section>';
   }).join('');
 
   if (hiddenKeys.length) {
@@ -2901,6 +3088,10 @@ function drawDsAll(dates, withTitle, zonesDataOverride) {
 }
 // one picture per zone (Delhi NCR, Mumbai, Zone B), so adding a zone never makes the image bigger
 function dsZoneBlob(zone, dates) {
+  if (zone === 'Mumbai' && dsmActive()) {
+    const cvm = drawDsm(dsmData(), state.showTitle);
+    return new Promise((res, rej) => cvm.toBlob(b => b ? res(b) : rej(new Error('Image failed')), 'image/png'));
+  }
   if (!dates.length || !dsZoneHasRows(zone, dates)) return Promise.reject(new Error('No ' + zone + ' data to draw'));
   const cv = drawDsAll(dates, state.showTitle, [{ zone, day: dates.map(d => dsDay(zone, d)) }]);
   return new Promise((res, rej) => cv.toBlob(b => b ? res(b) : rej(new Error('Image failed')), 'image/png'));
@@ -2930,13 +3121,14 @@ async function shareDsImages(zones, dates) {
    EXCEL  (whole current month, not hidden; cleared automatically on the 5th of a new month)
    ========================================================================== */
 async function downloadDsExcel() {
-  if (!dsHasHistory()) return;
+  if (!dsHasHistory() && !dsmActive()) return;
   try {
     const wb = new ExcelJS.Workbook(); wb.created = new Date();
     const thin = { style: 'thin', color: { argb: 'FFBFBFBF' } };
     const border = { top: thin, left: thin, bottom: thin, right: thin };
     const dates = Object.keys(dsHistory.days).sort();
     DS_ZONES.forEach(zone => {
+      if (zone === 'Mumbai' && dsmActive()) { dsmExcelSheet(wb, border); return; }
       if (!dates.length || !dsZoneHasRows(zone, dates)) return;
       const ws = wb.addWorksheet(zone, { views: [{ state: 'frozen', xSplit: 1, ySplit: 3 }] });
       ws.getColumn(1).width = 30;
@@ -4069,7 +4261,7 @@ function buildReportHTML() {
   const havePerf = perfHasHistory();
   const haveCod = COD_REGIONS.some(r => { const c = computeCod(r); return c && c.sections.length; });
   const dsDates = dsHasHistory() ? dsLastDays(DS_WINDOW) : [];
-  const haveDs = dsDates.length > 0;
+  const haveDs = dsDates.length > 0 || dsmActive();
   const dsoTabs = dsoFile() ? DSO_TABS.map(tb => ({ id: tb.id, d: computeDso(tb.id) })).filter(x => x.d && x.d.sections[0].rows.length) : [];
   const haveDso = dsoTabs.length > 0;
   const feTabs = feHasHistory() ? FE_TABS.map(tb => ({ id: tb.id, d: computeFe(tb.id) })).filter(x => x.d && x.d.rows.length) : [];
@@ -4106,7 +4298,7 @@ function buildReportHTML() {
     codData = COD_REGIONS.filter(r => { const c = computeCod(r); return c && c.sections.length; }).map((r, i) => ({ id: 'cr' + i, region: r, d: computeCod(r) }));
   }
   if (haveDs) {
-    dsData = DS_ZONES.filter(zone => dsZoneHasRows(zone, dsDates)).map(zone => ({ zone, file: dsImgName(zone), days: dsDates.map(dt => dsDay(zone, dt)) }));
+    dsData = DS_ZONES.filter(zone => dsZoneHasRows(zone, dsDates)).map(zone => (zone === 'Mumbai' && dsmActive() ? { zone, file: dsImgName(zone), dsm: dsmData() } : { zone, file: dsImgName(zone), days: dsDates.map(dt => dsDay(zone, dt)) }));
   }
   const runtimeData = {
     stamp: stampText(), showTitle: state.showTitle,
@@ -4124,12 +4316,12 @@ function buildReportHTML() {
     ',PERF_LABELS=' + JSON.stringify(PERF_LABELS) + ',PERF_PCT=' + JSON.stringify(PERF_PCT) + ',PERF_COL_W=' + JSON.stringify(PERF_COL_W) +
     ',RED=' + JSON.stringify(RED) + ',YEL=' + JSON.stringify(YEL) + ',GRN=' + JSON.stringify(GRN) +
     ',COD_LABELS=' + JSON.stringify(COD_LABELS) + ',COD_GROUPS=' + JSON.stringify(COD_GROUPS) + ',COD_COL_W=' + JSON.stringify(COD_COL_W) +
-    ',DS_LABELS=' + JSON.stringify(DS_LABELS) + ',DS_PCT=' + JSON.stringify(DS_PCT) +
+    ',DS_LABELS=' + JSON.stringify(DS_LABELS) + ',DS_PCT=' + JSON.stringify(DS_PCT) + ',DSM_LABELS=' + JSON.stringify(DSM_LABELS) +
     ',DSO_HEAD=' + JSON.stringify(DSO_HEAD) + ',DSO_PCTV=' + JSON.stringify(DSO_PCTV) + ',DSO_COL_W=' + JSON.stringify(DSO_COL_W) +
     ',SLA_W=' + JSON.stringify(SLA_W) + ';' +
     'const MON=' + JSON.stringify(MON) + ';const fmtInt=' + fmtInt + ';const fmtPct=' + fmtPct + ';const fmtDateLong=' + fmtDateLong + ';' +
     'var DATA=' + jsonForScript(runtimeData) + ';const stampText=function(){return DATA.stamp};\n' +
-    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsoFmt, drawDso, feFmt, drawFe, slaScale, slaFmt, slaDayLabel, slaBg, drawSla, ofdpPct, drawOfdp].join('\n');
+    [wrapLines, scaleColor, scaleColorPerf, fmtCell, drawZone, perfScales, perfFmtCell, drawPerfDay, codFmtCell, drawCod, dsScales, dsFmtCell, drawDsAll, dsmFmt, drawDsm, dsoFmt, drawDso, feFmt, drawFe, slaScale, slaFmt, slaDayLabel, slaBg, drawSla, ofdpPct, drawOfdp].join('\n');
 
   const uiSrc = '(function(){' +
     'var rt=[].slice.call(document.querySelectorAll("[data-rtab]")),rs=[].slice.call(document.querySelectorAll(".rsec"));' +
@@ -4145,7 +4337,7 @@ function buildReportHTML() {
     '[].slice.call(document.querySelectorAll("[data-pimg-v]")).forEach(function(b){b.onclick=function(){var vi=+b.dataset.pimgV,date=b.dataset.pimgD;perfBlobAt(vi,date).then(function(bl){saveAs(bl,DATA.perf[vi].dates.filter(function(x){return x.date===date})[0].file)})}});' +
     'function codBlobAt(i){var c=DATA.cod[i];var cv=drawCod(c.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-cimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.cimg;codBlobAt(i).then(function(bl){saveAs(bl,DATA.cod[i].file)})}});' +
-    'function dsBlob(i){var z=DATA.ds.zones[i];var cv=drawDsAll(DATA.ds.dates,DATA.showTitle,[{zone:z.zone,day:z.days}]);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
+    'function dsBlob(i){var z=DATA.ds.zones[i];var cv=z.dsm?drawDsm(z.dsm,DATA.showTitle):drawDsAll(DATA.ds.dates,DATA.showTitle,[{zone:z.zone,day:z.days}]);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-dsimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.dsimg;dsBlob(i).then(function(bl){saveAs(bl,DATA.ds.zones[i].file)})}});' +
     'function dsoBlobAt(i){var c=DATA.dso[i];var cv=drawDso(c.d,DATA.showTitle);return new Promise(function(r){cv.toBlob(r,"image/png")})}' +
     '[].slice.call(document.querySelectorAll("[data-dimg]")).forEach(function(b){b.onclick=function(){var i=+b.dataset.dimg;dsoBlobAt(i).then(function(bl){saveAs(bl,DATA.dso[i].file)})}});' +
@@ -4206,7 +4398,7 @@ function buildReportHTML() {
   }
   if (haveDs) {
     body += '<div class="rsec" id="r-ds"' + (rtabs.length > 1 ? ' hidden' : '') + '>';
-    body += dsData.map((x, i) => '<section class="panel"><div class="ph"><h2>' + esc(x.zone) + '</h2><button type="button" data-dsimg="' + i + '">Save as image</button></div>' + dsMultiTable(x.zone, dsDates, { static: true, days: x.days }) + '</section>').join('');
+    body += dsData.map((x, i) => '<section class="panel"><div class="ph"><h2>' + esc(x.zone) + '</h2><button type="button" data-dsimg="' + i + '">Save as image</button></div>' + (x.dsm ? dsmTableHTML(x.dsm) : dsMultiTable(x.zone, dsDates, { static: true, days: x.days })) + '</section>').join('');
     body += '</div>';
   }
   if (haveDso) {
