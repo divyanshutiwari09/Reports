@@ -692,7 +692,7 @@ function parseDsRows(rows, head) {
   const C = {
     awb: col('AWB NO'), fr: col('FRANCHISEE'), city: col('CITY'), cutoff: col('CUT-OFF CATEGORY'),
     fa: col('FIRST ATTEMPT'), faDate: col('FIRST ATTEMPT DATE'), faTime: col('FIRST ATTEMPT TIME'),
-    sda: col('SAME DAY ATTEMPT'), deliv: col('DELIVERED'), undel: col('UNDELIVERED TYPE'),
+    sda: col('SAME DAY ATTEMPT'), deliv: col('DELIVERED'), delDate: col('DELIVERED DATE'), undel: col('UNDELIVERED TYPE'),
     ordDate: col('CALCULATED ORDER DATE'), ordTime: col('CALCULATED ORDER TIME'), eddDate: col('EDD DATE'),
     tatType: col('TAT TYPE'), hrs: col('HRS')
   };
@@ -731,6 +731,8 @@ function parseDsRows(rows, head) {
     const delivVal = S(row[C.deliv]);
     const del = delivVal === 'Yes';
     const delOrVC = del || (delivVal === 'No' && S(row[C.undel]) === 'Verified');
+    // FASR success = delivered ON the first-attempt date (DELIVERED DATE = FIRST ATTEMPT DATE); falls back to DELIVERED = Yes if the column is missing
+    const delOnFa = del && (C.delDate < 0 || (row[C.faDate] != null && S(row[C.faDate]) !== '' && codParseDate(row[C.delDate]) === codParseDate(row[C.faDate])));
     const tatType = S(row[C.tatType]);
     let inTat = false;
     if (tatType === 'Hrs') {
@@ -748,7 +750,8 @@ function parseDsRows(rows, head) {
       agg.total++;
       if (inTat) agg.inTat++;
       if (sdaYes) agg.sameDay++;
-      if (faYes) { agg.attempt++; if (del) agg.deliv++; if (delOrVC) agg.delivVC++; }
+      if (delOrVC) agg.delivVC++;      // Del+VC: delivered or VC at any time, out of ALL orders
+      if (faYes) { agg.attempt++; if (delOnFa) agg.deliv++; }
     };
     bump(a.overall);
     if (S(row[C.cutoff]) === 'Before cut-off') bump(a.before);
@@ -759,12 +762,12 @@ function parseDsRows(rows, head) {
 /* ---- Mumbai DS Performance (new format). The system EDD is not used: EDD is rebuilt from PICKED UP TIME and the pincode's phase.
    Phase 1 (SDD): pickup up to 12:00 -> same day, after 12:00 -> next day.
    Phase 2/3:     pickup before 19:00 -> pickup date + 1, from 19:00 -> pickup date + 2.
-   SLA = first attempt on or before the EDD date; PPD/COD FASR and Del+VC are measured on those on-time attempted orders. ---- */
+   SLA = first attempt on or before the EDD date; PPD/COD FASR (delivered on the first-attempt date) are measured on those on-time attempted orders; Del+VC = delivered or VC at any time / all orders. ---- */
 function dsmBlank() { return { total: 0, ok: 0, ppdDen: 0, ppdNum: 0, codDen: 0, codNum: 0, vc: 0 }; }
 function parseDsMumbaiRows(rows, head) {
   const col = n => head.indexOf(n.toLowerCase());
   const C = { awb: col('AWB NO'), fr: col('FRANCHISEE'), pick: col('PICKED UP TIME'), pin: col('DELIVERY PINCODE'), pay: col('PAYMENT MODE'),
-    fa: col('FIRST ATTEMPT'), faDate: col('FIRST ATTEMPT DATE'), deliv: col('DELIVERED'), undel: col('UNDELIVERED TYPE'),
+    fa: col('FIRST ATTEMPT'), faDate: col('FIRST ATTEMPT DATE'), deliv: col('DELIVERED'), delDate: col('DELIVERED DATE'), undel: col('UNDELIVERED TYPE'),
     edd: col('EDD DATE'), ord: col('CALCULATED ORDER DATE') };
   const S = v => (v == null ? '' : String(v).trim());
   // a Mumbai file is one whose franchisees are all Mumbai hubs; anything else goes down the normal DS route
@@ -810,16 +813,19 @@ function parseDsMumbaiRows(rows, head) {
     const ok = faMs != null && faMs <= eddMs;                              // attempted on or before the EDD date
     const pay = S(row[C.pay]).toUpperCase().replace(/[^A-Z]/g, '');
     const dv = S(row[C.deliv]);
-    const delivered = dv === 'Yes';
-    const vc = delivered || (dv === 'No' && S(row[C.undel]) === 'Verified');
+    const anyDel = dv === 'Yes';
+    // FASR success = delivered ON the first-attempt date (same as the manual pivot: DELIVERED DATE minus FIRST ATTEMPT DATE = 0).
+    // An order delivered on a later day does not count. If the file has no DELIVERED DATE column, falls back to DELIVERED = Yes.
+    const delivered = anyDel && (C.delDate < 0 || (faMs != null && codParseDate(row[C.delDate]) === faMs));
+    const vc = anyDel || (dv === 'No' && S(row[C.undel]) === 'Verified');
     let day = days[iso]; if (!day) { day = { all: dsmBlank(), sdd: dsmBlank() }; days[iso] = day; }
     const bump = a => {
       a.total++;
+      if (vc) a.vc++;                                                    // Del+VC: delivered or VC at any time, out of ALL orders
       if (!ok) return;
       a.ok++;
       if (pay === 'PREPAID') { a.ppdDen++; if (delivered) a.ppdNum++; }
       if (pay === 'COD') { a.codDen++; if (delivered) a.codNum++; }
-      if (vc) a.vc++;
     };
     bump(day.all);
     if (ph === 1) bump(day.sdd);
@@ -2757,7 +2763,7 @@ function applyDsmFile() {
 }
 function dsmMetrics(a) {
   const dv = (n, d) => (d ? n / d : null);
-  return [a.total, a.total ? a.ok / a.total : null, dv(a.ppdNum, a.ppdDen), dv(a.codNum, a.codDen), dv(a.vc, a.ok)];
+  return [a.total, a.total ? a.ok / a.total : null, dv(a.ppdNum, a.ppdDen), dv(a.codNum, a.codDen), dv(a.vc, a.total)];
 }
 function dsmData(allDates) {
   const dates = allDates ? dsmDoneDates() : dsmDoneDates().slice(-DSM_WINDOW);
@@ -2869,7 +2875,7 @@ function dsSetChoice(key, val) { dsChoices[key] = val; saveDsChoices(); render()
 /* ---- metrics (SOP \u00a74) ---- */
 function dsMetricsFrom(agg) {
   if (!agg) return null;
-  return [agg.total, safeDiv(agg.inTat, agg.total), safeDiv(agg.sameDay, agg.total), safeDiv(agg.deliv, agg.attempt), safeDiv(agg.delivVC, agg.attempt)];
+  return [agg.total, safeDiv(agg.inTat, agg.total), safeDiv(agg.sameDay, agg.total), safeDiv(agg.deliv, agg.attempt), safeDiv(agg.delivVC, agg.total)];
 }
 function dsSumAgg(list) {
   const t = { total: 0, inTat: 0, sameDay: 0, attempt: 0, deliv: 0, delivVC: 0 };
