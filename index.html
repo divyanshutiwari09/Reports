@@ -322,10 +322,10 @@ const DS_COL_W = [72, 68, 78, 60, 64];
 const DSO_EXTRA = ['STATUS', 'PACKED', 'OFD', 'ATTEMPT COMPLIANCE', 'EDD TIME'];
 const FE_REQUIRED = ['DATE', 'DELIVERY CENTRE', 'PAYOUT TYPE', 'ALLOCATED ROUTE', 'ACTUAL ROUTE', 'TOTAL DELIVERY', 'OUT OF TAT DELIVERY'];
 const SLA_REQUIRED = ['REACHED_HUB_TIMESTAMP', 'ATTEMPT 1 TIME', 'DELIVERED_TIMESTAMP', 'OUT_FOR_DELIVERY_TIMESTAMP', 'OTP_VERIFIED_TIMESTAMP', 'CANCELLED_TIMESTAMP', 'PAYMENT TYPE', 'ARRIVED AT WAREHOUSE', 'DEST WAREHOUSE'];
-// Only these four branches are reported; any other DEST WAREHOUSE is ignored. A branch matches when its DEST WAREHOUSE
+// Only these five branches are reported; any other DEST WAREHOUSE is ignored. A branch matches when its DEST WAREHOUSE
 // starts with the key (spaces, underscores and case ignored), so 'Shalimar Bagh_ND_PD' and a renamed suffix both work.
 const SLA_BRANCHES = [{ key: 'SHALIMARBAGH', label: 'Shalimar Bagh' }, { key: 'SANTNAGAR', label: 'Sant Nagar' },
-  { key: 'PAHARGANJ', label: 'Paharganj' }, { key: 'DAYALBAGH', label: 'Dayal Bagh' }];
+  { key: 'PAHARGANJ', label: 'Paharganj' }, { key: 'DAYALBAGH', label: 'Dayal Bagh' }, { key: 'CHEEMACHOWK', label: 'Cheema Chowk' }];
 const SLA_WINDOW = 15;   // latest dates shown
 const DS_WINDOW = 2;     // days shown on screen, in the image and on the shared page
 const DS_CLEAN_DAY = 5;  // last month's DS Performance data is cleared once the report date reaches the 5th
@@ -559,8 +559,8 @@ function parsePerfRows(rows, head) {
     const city = S(row[C.city]), svc = S(row[C.svc]);
     let view = null;                                                  // the five views
     if (city === 'Delhi/NCR') { if (svc === 'NDD') view = 'DELHI NDD'; else if (svc === 'SDD') view = 'DELHI SDD'; }
-    else if (city === 'Mumbai') view = 'MUMBAI';
-    else if (city === 'Bengaluru') view = 'BENGALURU';
+    else if (city === 'Mumbai') { if (svc === 'NDD') view = 'MUMBAI'; }          // NDD only, like Delhi NDD
+    else if (city === 'Bengaluru') { if (svc === 'NDD') view = 'BENGALURU'; }    // NDD only; only Zone B takes NDD + SDD
     else if (svc === 'NDD' || svc === 'SDD') view = 'ZONE B';
     if (!view) continue;
     const mgr = S(row[C.mgr]), hub = S(row[C.hub]);
@@ -1004,7 +1004,7 @@ function parseSlaRows(rows, head) {
     const row = rows[r]; if (!row || !row.length) continue;
     const radMs = slaParseTS(row[C.rad]); if (radMs == null) continue;    // every metric is keyed off RAD (reached-hub) being present
     const dk = bkey(S(row[C.dest]));
-    const br = branches.find(x => dk.indexOf(x.key) === 0);               // null = not one of the four branches
+    const br = branches.find(x => dk.indexOf(x.key) === 0);               // null = not one of the five branches
     totalAll++;
     const radDate = slaDateOnly(radMs), iso = slaDateSlug(radDate);
     const att1Ms = slaParseTS(row[C.att1]);
@@ -1044,7 +1044,7 @@ function parseSlaRows(rows, head) {
     let day = br.days.get(iso); if (!day) { day = slaBlank(); br.days.set(iso, day); }
     bump(day);
   }
-  if (!total) throw new Error('No rows for Shalimar Bagh, Sant Nagar, Paharganj or Dayal Bagh (DEST WAREHOUSE) with a REACHED_HUB_TIMESTAMP date were found.');
+  if (!total) throw new Error('No rows for Shalimar Bagh, Sant Nagar, Paharganj, Dayal Bagh or Cheema Chowk (DEST WAREHOUSE) with a REACHED_HUB_TIMESTAMP date were found.');
   return { kind: 'sla', branches, all, total, totalAll, other, dates: Array.from(branchDates).sort(), rows: total };
 }
 function slaMetrics(a) {
@@ -1448,21 +1448,27 @@ function newPct(newDone, fresh, intransit, altDen) {
 // Percentages are never shown above 100%.
 function capAll(list) {
   let capped = false;
-  const out = list.map(v => { if (v > 1 + 1e-9) { capped = true; return 1; } return v; });
+  const out = list.map(v => { if (v < 0) return 0; if (v > 1 + 1e-9) { capped = true; return 1; } return v; });   // negative % shown as 0
   return { out, capped };
 }
 
-function calcRow(a) {
+function calcRow(a, legacy) {
   const C = a.reattempt, D = a.fresh, E = a.intransit, F = a.pendFE, K = a.oc;
   const P = a.nonOld, Q = a.nonNew;
   const zero = Math.min(a.nonOld0, P), gt = Math.max(0, P - zero);
-  const G = (C + D) - E - F;
+  const Graw = (C + D) - E - F;
   const rawNew = D - E - Q;
   const Inew = Math.max(0, rawNew);
-  const H = (C - F - P) + Math.min(0, rawNew);
-  const J = (H + Inew) - K;
+  const Hraw = (C - F - P) + Math.min(0, rawNew);
+  let G, H, J;
+  if (legacy) { G = Graw; H = Hraw; J = (H + Inew) - K; }      // old formulas (Pincode report keeps using these)
+  else {
+    G = Math.max(0, Graw);                                        // any negative count becomes 0
+    H = Math.max(0, Hraw);
+    J = Math.max(0, (H + Inew) - K);                              // Total OFD done = New OFD done + Old OFD done - Office Closed (never below 0)
+  }
   const np = newPct(Inew, D, E, Inew > 0 ? D - E : 0);
-  const pc = capAll([safeDiv(H, C - F), np.v, safeDiv(J, G), safeDiv(J + K, G)]);
+  const pc = capAll([safeDiv(H, C - F), np.v, safeDiv(J, G), safeDiv(H + Inew, G)]);   // negative % become 0; with-OC % = (Old + New done) / to be done
   const cells = [a.name, C, D, E, F, G, H, Inew, J, K, pc.out[0], pc.out[1], pc.out[2], pc.out[3],
                  zero, gt, Q, P + Q];
   return { key: a.key, name: a.name, cells, vol: C + D, capped: pc.capped };
@@ -3718,7 +3724,7 @@ async function downloadFeExcel() {
    already covers a full rolling month and fully replaces the one before it)
    ========================================================================== */
 // Two pages, one image each: same-day numbers and matured numbers. Rows are metric blocks (SLA, PPD FASR, COD FASR,
-// Del+VC, Load), each listing the four branches, then a Total block over every row whatever the DEST WAREHOUSE.
+// Del+VC, Load), each listing the five branches, then a Total block over every row whatever the DEST WAREHOUSE.
 const SLA_PAGES = [
   { id: 'same', tag: 'Same day', title: 'Daily SLA / FASR \u2013 Same day', cols: [1, 2, 3, 4, 0], labels: ['SLA', 'PPD FASR', 'COD FASR', 'Del+VC', 'Load'] },
   { id: 'mat', tag: 'Matured', title: 'Daily SLA / FASR \u2013 Matured', cols: [7, 8, 9, 10, 0], labels: ['SLA Matured', 'PPD FASR Matured', 'COD FASR Matured', 'Del+VC Matured', 'Load'] }
@@ -3743,7 +3749,7 @@ function computeSla(pageId) {
   const tm = metrics(p.all.days);
   const blocks = pg.cols.map((ci, k) => ({ label: pg.labels[k], rows: bm.map(b => ({ label: b.label, ci, cells: b.m.map(x => (x ? x[ci] : null)) })) }));
   const totalBlock = { label: 'Total', total: true, rows: pg.cols.map((ci, k) => ({ label: pg.labels[k], ci, cells: tm.map(x => (x ? x[ci] : null)) })) };
-  // Heat colours: each % metric is scaled across its four branches, all dates and the Total row, so branches are
+  // Heat colours: each % metric is scaled across its five branches, all dates and the Total row, so branches are
   // comparable; Load is scaled along each row (branches and the total differ a lot in size).
   blocks.forEach((bl, k) => {
     const ci = bl.rows[0].ci, tr = totalBlock.rows[k];
@@ -3765,7 +3771,7 @@ function slaTableHTML(d) {
 function renderSla() {
   const host = $('#results');
   const f = slaFile();
-  if (!f) { host.innerHTML = '<div class="panel"><div class="empty"><b>No SLA/FASR/OFD data yet</b>Drop the raw daily CSV/XLSX. Only Shalimar Bagh, Sant Nagar, Paharganj and Dayal Bagh (DEST WAREHOUSE) are used, for the latest ' + SLA_WINDOW + ' dates.</div></div>'; return; }
+  if (!f) { host.innerHTML = '<div class="panel"><div class="empty"><b>No SLA/FASR/OFD data yet</b>Drop the raw daily CSV/XLSX. Only Shalimar Bagh, Sant Nagar, Paharganj, Dayal Bagh and Cheema Chowk (DEST WAREHOUSE) are used, for the latest ' + SLA_WINDOW + ' dates.</div></div>'; return; }
   const anyShare = canShareFiles();
   let html = '';
   SLA_PAGES.forEach((pg, i) => {
@@ -3863,7 +3869,7 @@ function ofdpTableHTML(d, opts) {
     h += '<tr' + (r.indent ? '' : ' style="font-weight:700;background:#F2F2F2"') + '><td class="nm">' + (r.indent ? '&nbsp;&nbsp;' : '') + esc(r.name) +
       (opts.static ? '' : '<button class="x" data-ofdprm="' + esc(r.key) + '" title="Leave out ' + esc(r.name) + '" aria-label="Leave out ' + esc(r.name) + '">&times;</button>') + '</td>' +
       r.vals.map(v => '<td>' + fmtInt(v) + '</td>').join('') +
-      '<td style="background:' + (scaleColorPerf(r.pct, { min: 0, mid: 1, max: 2 }) || '') + '">' + fmtPct(r.pct) + '</td></tr>';
+      '<td style="background:' + (scaleColorPerf(-r.pct, { min: -2, mid: -1, max: 0 }) || '') + '">' + fmtPct(r.pct) + '</td></tr>';   // reversed: big % = red, small % = green
   });
   return h + '</tbody></table></div>';
 }
@@ -3922,7 +3928,7 @@ function drawOfdp(d, withTitle) {
     ctx.font = (bold ? 'bold ' : '') + '13px Arial, Helvetica, sans-serif';
     box(xx, y, w0, rowH, fill); ctx.fillStyle = '#000'; ctx.textAlign = 'left'; ctx.fillText((r.indent ? '   ' : '') + r.name, xx + 7, y + rowH / 2 + 1); xx += w0;
     r.vals.forEach(v => { box(xx, y, colW, rowH, fill); ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.fillText(fmtInt(v), xx + colW / 2, y + rowH / 2 + 1); xx += colW; });
-    const bg = scaleColorPerf(r.pct, { min: 0, mid: 1, max: 2 });
+    const bg = scaleColorPerf(-r.pct, { min: -2, mid: -1, max: 0 });   // reversed: big % = red, small % = green
     box(xx, y, pctW, rowH, bg || fill); ctx.fillStyle = '#000'; ctx.textAlign = 'center'; ctx.fillText(fmtPct(r.pct), xx + pctW / 2, y + rowH / 2 + 1);
     y += rowH;
   });
@@ -3966,7 +3972,7 @@ async function downloadOfdpExcel() {
     });
     if (d.rows.length) {
       const L = openpyxlCol(pctCol);
-      ws.addConditionalFormatting({ ref: L + '2:' + L + (d.rows.length + 1), rules: [{ type: 'colorScale', priority: 1, cfvo: [{ type: 'min' }, { type: 'percentile', value: 50 }, { type: 'max' }], color: [{ argb: 'FFF8696B' }, { argb: 'FFFFEB84' }, { argb: 'FF63BE7B' }] }] });
+      ws.addConditionalFormatting({ ref: L + '2:' + L + (d.rows.length + 1), rules: [{ type: 'colorScale', priority: 1, cfvo: [{ type: 'min' }, { type: 'percentile', value: 50 }, { type: 'max' }], color: [{ argb: 'FF63BE7B' }, { argb: 'FFFFEB84' }, { argb: 'FFF8696B' }] }] });   // low = green, high = red
     }
     const name = 'OFD_Done_Report_Pending_' + (dates[dates.length - 1] || dateSlug()) + '.xlsx';
     saveBlob(new Blob([await wb.xlsx.writeBuffer()], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), name);
@@ -4023,7 +4029,7 @@ function computePin() {
   // the OFD dashboard's own formulas (negative new-OFD-done moves into old OFD done), then anything negative becomes 0
   const calc = new Map();
   agg.forEach((a, k) => {
-    const c = calcRow(a).cells;               // [name, C old, D fresh, E intransit, F pending FE, G to be done, H old done, I new done, J total done, ...]
+    const c = calcRow(a, true).cells;         // legacy formulas on purpose, so this report is unchanged. [name, C old, D fresh, E intransit, F pending FE, G to be done, H old done, I new done, J total done, ...]
     const done = Math.max(0, c[8]);
     calc.set(k, [Math.max(0, c[2]), Math.max(0, c[1]), Math.max(0, c[1] + c[2]), done, Math.max(0, c[5] - done)]);
   });
