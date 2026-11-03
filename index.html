@@ -818,18 +818,24 @@ function parseDsMumbaiRows(rows, head) {
     // An order delivered on a later day does not count. If the file has no DELIVERED DATE column, falls back to DELIVERED = Yes.
     const delivered = anyDel && (C.delDate < 0 || (faMs != null && codParseDate(row[C.delDate]) === faMs));
     const vc = anyDel || (dv === 'No' && S(row[C.undel]) === 'Verified');
-    let day = days[iso]; if (!day) { day = { all: dsmBlank(), sdd: dsmBlank() }; days[iso] = day; }
-    const bump = a => {
-      a.total++;
-      if (vc) a.vc++;                                                    // Del+VC: delivered or VC at any time, out of ALL orders
-      if (!ok) return;
-      a.ok++;
-      if (pay === 'PREPAID') { a.ppdDen++; if (delivered) a.ppdNum++; }
-      if (pay === 'COD') { a.codDen++; if (delivered) a.codNum++; }
-    };
-    bump(day.all);
-    if (ph === 1) bump(day.sdd);
+    let day = days[iso]; if (!day) { day = { recs: {} }; days[iso] = day; }
+    // one compact record per AWB: 1 on-time attempt, 2 prepaid, 4 COD, 8 delivered on the first-attempt date, 16 delivered or VC, 32 phase 1 (SDD)
+    day.recs[S(row[C.awb])] = (ok ? 1 : 0) | (pay === 'PREPAID' ? 2 : 0) | (pay === 'COD' ? 4 : 0) | (delivered ? 8 : 0) | (vc ? 16 : 0) | (ph === 1 ? 32 : 0);
   }
+  Object.keys(days).forEach(iso => {
+    const day = days[iso]; day.all = dsmBlank(); day.sdd = dsmBlank();
+    Object.keys(day.recs).forEach(k => {
+      const c = day.recs[k];
+      [day.all].concat(c & 32 ? [day.sdd] : []).forEach(a => {
+        a.total++;
+        if (c & 16) a.vc++;                                              // Del+VC: delivered or VC at any time, out of ALL orders
+        if (!(c & 1)) return;
+        a.ok++;
+        if (c & 2) { a.ppdDen++; if (c & 8) a.ppdNum++; }
+        if (c & 4) { a.codDen++; if (c & 8) a.codNum++; }
+      });
+    });
+  });
   return { kind: 'dsm', days, dates: Object.keys(days).sort(), rows: total, excluded, noPickup, unmapped, unmappedN };
 }
 
@@ -2749,10 +2755,14 @@ function dsmDoneDates() { const t = todayISO(); return Object.keys(dsmHistory.da
 function dsmActive() { return dsmDoneDates().length > 0; }
 function applyDsmFile() {
   const f = dsmFile(); if (!f) return;
-  let kept = 0;
+  let kept = 0, merged = 0;
   f.dsm.dates.forEach(iso => {
     const nw = f.dsm.days[iso], old = dsmHistory.days[iso];
-    if (old && old.all.total > nw.all.total) { kept++; return; }   // never replace a day with a smaller one (a short file must not shrink it)
+    // One EDD day is spread over several raw files (a file holds the orders picked up in its own window), so files are merged by AWB:
+    // an AWB already saved is updated by the newer file, a new AWB is added. An AWB is never counted twice.
+    if (old && old.recs) { dsmHistory.days[iso] = dsmDayFromRecs(Object.assign({}, old.recs, nw.recs)); merged++; return; }
+    // a day saved before AWB detail was kept: it cannot be merged, so only replace it with a file that has at least as many orders
+    if (old && old.all.total > nw.all.total) { kept++; return; }
     dsmHistory.days[iso] = nw;
   });
   const keys = Object.keys(dsmHistory.days).sort(), latest = keys[keys.length - 1];
@@ -2764,8 +2774,24 @@ function applyDsmFile() {
   let msg = f.name + ': Mumbai loaded, ' + ds.length + ' EDD dates' + (ds.length ? ' (' + fmtDateLong(ds[0]) + ' to ' + fmtDateLong(ds[ds.length - 1]) + ')' : '') + '.';
   if (p.noPickup) msg += ' ' + p.noPickup + ' orders with no pickup time were left out.';
   if (p.unmappedN) msg += ' ' + p.unmappedN + ' orders had a pincode that is not in the phase sheet (' + Object.keys(p.unmapped).slice(0, 4).join(', ') + '), counted as next-day in Overall only.';
-  if (kept) msg += ' ' + kept + ' dates kept as they were because this file had fewer orders for them.';
+  if (merged) msg += ' ' + merged + ' dates merged with earlier files by AWB.';
+  if (kept) msg += ' ' + kept + ' older dates kept as they were because this file had fewer orders for them. Upload that day\u2019s earlier files again to rebuild it.';
   toast(msg);
+}
+function dsmDayFromRecs(recs) {
+  const day = { recs, all: dsmBlank(), sdd: dsmBlank() };
+  Object.keys(recs).forEach(k => {
+    const c = recs[k];
+    [day.all].concat(c & 32 ? [day.sdd] : []).forEach(a => {
+      a.total++;
+      if (c & 16) a.vc++;
+      if (!(c & 1)) return;
+      a.ok++;
+      if (c & 2) { a.ppdDen++; if (c & 8) a.ppdNum++; }
+      if (c & 4) { a.codDen++; if (c & 8) a.codNum++; }
+    });
+  });
+  return day;
 }
 function dsmMetrics(a) {
   const dv = (n, d) => (d ? n / d : null);
