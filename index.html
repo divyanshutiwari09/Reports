@@ -2734,6 +2734,10 @@ function resetDsHistory() {
   lsDel(nsKey(DS_HKEY)); lsDel(nsKey(DS_CHKEY)); lsDel(nsKey(DS_KNKEY)); lsDel(nsKey(DSM_HKEY));
   loadDs(); render(); toast('Saved DS Performance data cleared');
 }
+// Clears only the Mumbai history (Delhi NCR and Zone B history, and the hub choices, are left as they are)
+function resetDsmHistory() {
+  lsDel(nsKey(DSM_HKEY)); loadDsm(); render(); toast('Saved Mumbai DS Performance data cleared. Delhi NCR and Zone B are unchanged.');
+}
 function dsHasHistory() { return Object.keys(dsHistory.days).length > 0; }
 function dsLastDays(n) { return Object.keys(dsHistory.days).sort().slice(-n); }
 function dsCleanupOldMonth(latestDate) {
@@ -2755,7 +2759,16 @@ function dsmDoneDates() { const t = todayISO(); return Object.keys(dsmHistory.da
 function dsmActive() { return dsmDoneDates().length > 0; }
 function applyDsmFile() {
   const f = dsmFile(); if (!f) return;
-  let kept = 0, merged = 0;
+  let kept = 0, merged = 0, moved = 0;
+  // An AWB is counted once in total: if this file puts an AWB on a different date than an earlier file did, it is taken off the old date.
+  const newDayOf = {};
+  f.dsm.dates.forEach(iso => { Object.keys(f.dsm.days[iso].recs).forEach(a => { newDayOf[a] = iso; }); });
+  Object.keys(dsmHistory.days).forEach(iso => {
+    const d = dsmHistory.days[iso]; if (!d || !d.recs) return;
+    let changed = false;
+    Object.keys(d.recs).forEach(a => { if (newDayOf[a] && newDayOf[a] !== iso) { delete d.recs[a]; changed = true; moved++; } });
+    if (changed) { if (Object.keys(d.recs).length) dsmHistory.days[iso] = dsmDayFromRecs(d.recs); else delete dsmHistory.days[iso]; }
+  });
   f.dsm.dates.forEach(iso => {
     const nw = f.dsm.days[iso], old = dsmHistory.days[iso];
     // One EDD day is spread over several raw files (a file holds the orders picked up in its own window), so files are merged by AWB:
@@ -2775,6 +2788,7 @@ function applyDsmFile() {
   if (p.noPickup) msg += ' ' + p.noPickup + ' orders with no pickup time were left out.';
   if (p.unmappedN) msg += ' ' + p.unmappedN + ' orders had a pincode that is not in the phase sheet (' + Object.keys(p.unmapped).slice(0, 4).join(', ') + '), counted as next-day in Overall only.';
   if (merged) msg += ' ' + merged + ' dates merged with earlier files by AWB.';
+  if (moved) msg += ' ' + moved + ' AWBs moved to a new date because this file puts them on a different EDD.';
   if (kept) msg += ' ' + kept + ' older dates kept as they were because this file had fewer orders for them. Upload that day\u2019s earlier files again to rebuild it.';
   toast(msg);
 }
@@ -4214,8 +4228,10 @@ function render() {
   const which = state.report === 'ofd' ? 'OFD branch' : state.report === 'perf' ? 'Daily performance' : state.report === 'cod' ? 'COD Pendency' : state.report === 'dso' ? 'DS OFD' : state.report === 'fe' ? 'FE Dashboard' : state.report === 'sla' ? 'SLA/FASR/OFD' : state.report === 'ofdp' ? 'OFD Done/Report Pending' : state.report === 'pin' ? 'Pincode dashboard' : 'DS Performance';
   const canForget = state.report !== 'sla' && state.report !== 'pin';
   rs.innerHTML = '<button class="link" id="pubSettings">Publish settings</button>' + (canForget ? ' &nbsp; <button class="link" id="resetChoices">Forget saved ' + which + ' choices</button>' : '') +
+    (state.report === 'ds' ? ' &nbsp; <button class="link" id="resetMumbai">Forget saved Mumbai data only</button>' : '') +
     (storageOK ? '' : ' <span>(this browser is not allowing saved settings)</span>');
   if (canForget) $('#resetChoices').onclick = () => { state.report === 'ofd' ? resetChoices() : state.report === 'perf' ? resetPerfHistory() : state.report === 'cod' ? resetCodChoices() : state.report === 'dso' ? resetDsoChoices() : state.report === 'fe' ? resetFeChoices() : state.report === 'ofdp' ? resetOfdpChoices() : resetDsHistory(); };
+  if ($('#resetMumbai')) $('#resetMumbai').onclick = () => resetDsmHistory();
   $('#pubSettings').onclick = () => showPubSetup();
 }
 
