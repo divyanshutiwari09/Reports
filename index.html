@@ -1458,7 +1458,7 @@ function capAll(list) {
   return { out, capped };
 }
 
-function calcRow(a, legacy) {
+function calcRow(a) {
   const C = a.reattempt, D = a.fresh, E = a.intransit, F = a.pendFE, K = a.oc;
   const P = a.nonOld, Q = a.nonNew;
   const zero = Math.min(a.nonOld0, P), gt = Math.max(0, P - zero);
@@ -1466,13 +1466,9 @@ function calcRow(a, legacy) {
   const rawNew = D - E - Q;
   const Inew = Math.max(0, rawNew);
   const Hraw = (C - F - P) + Math.min(0, rawNew);
-  let G, H, J;
-  if (legacy) { G = Graw; H = Hraw; J = (H + Inew) - K; }      // old formulas (Pincode report keeps using these)
-  else {
-    G = Math.max(0, Graw);                                        // any negative count becomes 0
-    H = Math.max(0, Hraw);
-    J = Math.max(0, (H + Inew) - K);                              // Total OFD done = New OFD done + Old OFD done - Office Closed (never below 0)
-  }
+  const G = Math.max(0, Graw);                                    // any negative count becomes 0
+  const H = Math.max(0, Hraw);                                    // Old OFD done never below 0
+  const J = Math.max(0, (H + Inew) - K);                          // Total OFD done = New OFD done + Old OFD done - Office Closed (never below 0)
   const np = newPct(Inew, D, E, Inew > 0 ? D - E : 0);
   const pc = capAll([safeDiv(H, C - F), np.v, safeDiv(J, G), safeDiv(H + Inew, G)]);   // negative % become 0; with-OC % = (Old + New done) / to be done
   const cells = [a.name, C, D, E, F, G, H, Inew, J, K, pc.out[0], pc.out[1], pc.out[2], pc.out[3],
@@ -1487,7 +1483,7 @@ function calcTotal(rows) {
   // base for the fallback: (Fresh - Intransit) of the branches that have New OFD Done above 0
   const altDen = rows.reduce((t, r) => t + (r.cells[I.NEWD] > 0 ? r.cells[I.FRESH] - r.cells[I.INTR] : 0), 0);
   const np = newPct(Ni, D, E, altDen);
-  const pc = capAll([safeDiv(H, C - F), np.v, safeDiv(J, G), safeDiv(J + K, G)]);
+  const pc = capAll([safeDiv(H, C - F), np.v, safeDiv(J, G), safeDiv(H + Ni, G)]);   // with-OC % = (Old + New done) / to be done, same as the branch rows
   const cells = ['GRAND TOTAL', C, D, E, F, G, H, Ni, J, K, pc.out[0], pc.out[1], pc.out[2], pc.out[3],
                  s(I.N0), s(I.N1), s(I.NNEW), s(I.NTOT)];
   return { cells, fb: np.fb, capped: pc.capped };
@@ -1496,7 +1492,7 @@ function calcTotal(rows) {
 function computeZone(zone) {
   const f = zoneFile(zone);
   if (!f) return null;
-  const all = Array.from(f.branches.values()).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)).map(calcRow);
+  const all = Array.from(f.branches.values()).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)).map(a => calcRow(a));
   const shown = [], hidden = [], fresh = [];
   all.forEach(r => {
     const st = (choices[zone] || {})[r.key];
@@ -4069,7 +4065,7 @@ function computePin() {
   // the OFD dashboard's own formulas (negative new-OFD-done moves into old OFD done), then anything negative becomes 0
   const calc = new Map();
   agg.forEach((a, k) => {
-    const c = calcRow(a, true).cells;         // legacy formulas on purpose, so this report is unchanged. [name, C old, D fresh, E intransit, F pending FE, G to be done, H old done, I new done, J total done, ...]
+    const c = calcRow(a).cells;         // same OFD dashboard rules (negatives become 0). [name, C old, D fresh, E intransit, F pending FE, G to be done, H old done, I new done, J total done, ...]
     const done = Math.max(0, c[8]);
     calc.set(k, [Math.max(0, c[2]), Math.max(0, c[1]), Math.max(0, c[1] + c[2]), done, Math.max(0, c[5] - done)]);
   });
